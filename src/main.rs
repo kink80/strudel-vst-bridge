@@ -14,6 +14,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 
+use rack::vst3::{Vst3Scanner, Vst3Plugin};
+use rack::{MidiEvent, PluginInstance, PluginScanner, PluginInfo as RackPluginInfo, PluginType as RackPluginType};
+
 const SAMPLE_RATE: f64 = 48000.0;
 const BLOCK_SIZE: u32 = 512;
 
@@ -63,6 +66,29 @@ struct PluginHandle {
 impl Drop for PluginHandle {
     fn drop(&mut self) {
         unsafe { auv3_destroy_plugin(self.ptr); }
+    }
+}
+
+enum LoadedPlugin {
+    Au(Arc<StdMutex<PluginHandle>>),
+    Vst3(Arc<StdMutex<Vst3PluginHandle>>),
+}
+
+struct Vst3PluginHandle {
+    plugin: Vst3Plugin,
+    name: String,
+    info: RackPluginInfo,
+}
+
+unsafe impl Send for Vst3PluginHandle {}
+
+fn parse_plugin_format(plugin_id: &str) -> (&str, &str) {
+    if let Some(name) = plugin_id.strip_suffix(" (VST3)") {
+        (name, "vst3")
+    } else if let Some(name) = plugin_id.strip_suffix(" (AU)") {
+        (name, "au")
+    } else {
+        (plugin_id, "au") // default to AU for backwards compatibility
     }
 }
 
