@@ -1,0 +1,470 @@
+//! strudel-vst-bridge: WebSocket server that hosts AU plugins via AUv3 API with GUI support.
+
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
+use std::net::SocketAddr;
+use std::os::raw::c_char;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
+
+use futures_util::{SinkExt, StreamExt};
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::Message;
+
+const SAMPLE_RATE: f64 = 48000.0;
+const BLOCK_SIZE: u32 = 512;
+
+// ─── FFI to auv3_host.m ────────────────────────────────────────────────────
+
+#[repr(C)]
+pub struct AUv3Plugin {
+    _opaque: [u8; 0],
+}
+
+extern "C" {
+    fn auv3_load_plugin(name: *const c_char, sample_rate: f64, max_frames: u32) -> *mut AUv3Plugin;
+    fn auv3_destroy_plugin(plugin: *mut AUv3Plugin);
+    fn auv3_note_on(plugin: *mut AUv3Plugin, note: u8, velocity: u8, channel: u8) -> i32;
+    fn auv3_note_off(plugin: *mut AUv3Plugin, note: u8, velocity: u8, channel: u8) -> i32;
+    fn auv3_render(plugin: *mut AUv3Plugin, num_frames: u32, out_left: *mut f32, out_right: *mut f32) -> i32;
+    fn auv3_show_gui(plugin: *mut AUv3Plugin);
+    fn auv3_parameter_count(plugin: *mut AUv3Plugin) -> u32;
+    fn auv3_set_parameter(plugin: *mut AUv3Plugin, index: u32, value: f32) -> i32;
+    fn auv3_get_parameter(plugin: *mut AUv3Plugin, index: u32) -> f32;
+    fn auv3_get_name(plugin: *mut AUv3Plugin) -> *const c_char;
+    fn auv3_run_main_loop();
+    fn auv3_show_gui_async(plugin: *mut AUv3Plugin);
+    fn auv3_list_plugins(out: *mut AUv3PluginInfoC, max_out: u32) -> u32;
+}
+
+#[repr(C)]
+#[derive(Clone)]
+struct AUv3PluginInfoC {
+    name: [u8; 256],
+    manufacturer: [u8; 256],
+    plugin_type: [u8; 32],
+}
+
+fn c_str(buf: &[u8]) -> String {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).to_string()
+}
+
+unsafe impl Send for PluginHandle {}
+
+struct PluginHandle {
+    ptr: *mut AUv3Plugin,
+    name: String,
+}
+
+impl Drop for PluginHandle {
+    fn drop(&mut self) {
+        unsafe { auv3_destroy_plugin(self.ptr); }
+    }
+}
+
+// macOS event loop handled by auv3_pump_events() in auv3_host.m
+
+// ─── Protocol types ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+enum IncomingMessage {
+    #[serde(rename = "load_plugin")]
+    LoadPlugin {
+        #[serde(rename = "pluginId")]
+        plugin_id: String,
+        path: Option<String>,
+    },
+    #[serde(rename = "render")]
+    Render {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "pluginId")]
+        plugin_id: String,
+        note: u8,
+        #[serde(default = "default_velocity")]
+        velocity: f32,
+        #[serde(default = "default_duration")]
+        duration: f32,
+        #[serde(default)]
+        params: HashMap<String, f32>,
+    },
+    #[serde(rename = "show_gui")]
+    ShowGui {
+        #[serde(rename = "pluginId")]
+        plugin_id: String,
+    },
+    #[serde(rename = "list_plugins")]
+    ListPlugins,
+}
+
+fn default_velocity() -> f32 { 0.8 }
+fn default_duration() -> f32 { 1.0 }
+
+#[derive(Serialize)]
+struct PluginLoadedMsg {
+    #[serde(rename = "type")]
+    msg_type: &'static str,
+    #[serde(rename = "pluginId")]
+    plugin_id: String,
+    name: String,
+    params: Vec<ParamInfoMsg>,
+}
+
+#[derive(Serialize)]
+struct ParamInfoMsg {
+    index: usize,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct ErrorMsg {
+    #[serde(rename = "type")]
+    msg_type: &'static str,
+    #[serde(rename = "pluginId")]
+    plugin_id: Option<String>,
+    #[serde(rename = "requestId")]
+    request_id: Option<u32>,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct GuiOpenedMsg {
+    #[serde(rename = "type")]
+    msg_type: &'static str,
+    #[serde(rename = "pluginId")]
+    plugin_id: String,
+}
+
+// ─── Plugin manager ─────────────────────────────────────────────────────────
+
+struct PluginManager {
+    plugins: HashMap<String, Arc<StdMutex<PluginHandle>>>,
+}
+
+impl PluginManager {
+    fn new() -> Self {
+        Self { plugins: HashMap::new() }
+    }
+
+    fn load_plugin(&mut self, plugin_id: &str) -> Result<PluginLoadedMsg, String> {
+        if self.plugins.contains_key(plugin_id) {
+            let handle = self.plugins.get(plugin_id).unwrap().lock().unwrap();
+            return Ok(PluginLoadedMsg {
+                msg_type: "plugin_loaded",
+                plugin_id: plugin_id.to_string(),
+                name: handle.name.clone(),
+                params: vec![],
+            });
+        }
+
+        let c_name = CString::new(plugin_id).map_err(|e| format!("Invalid name: {e}"))?;
+        let ptr = unsafe { auv3_load_plugin(c_name.as_ptr(), SAMPLE_RATE, BLOCK_SIZE) };
+        if ptr.is_null() {
+            return Err(format!("Failed to load plugin: {plugin_id}"));
+        }
+
+        let name = unsafe {
+            let cstr = auv3_get_name(ptr);
+            CStr::from_ptr(cstr).to_string_lossy().to_string()
+        };
+
+        info!("Plugin loaded: {} (via AUv3)", name);
+
+        let handle = PluginHandle { ptr, name: name.clone() };
+        self.plugins.insert(plugin_id.to_string(), Arc::new(StdMutex::new(handle)));
+
+        Ok(PluginLoadedMsg {
+            msg_type: "plugin_loaded",
+            plugin_id: plugin_id.to_string(),
+            name,
+            params: vec![],
+        })
+    }
+
+    fn get_plugin(&self, plugin_id: &str) -> Option<Arc<StdMutex<PluginHandle>>> {
+        self.plugins.get(plugin_id).cloned()
+    }
+}
+
+// ─── Audio rendering ────────────────────────────────────────────────────────
+
+fn render_note(
+    handle: &PluginHandle,
+    note: u8,
+    velocity: f32,
+    duration_secs: f32,
+    _params: &HashMap<String, f32>,
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let total_samples = (duration_secs * SAMPLE_RATE as f32) as usize;
+    let release_samples = (2.0 * SAMPLE_RATE as f32) as usize;
+    let max_samples = total_samples + release_samples;
+
+    let mut left_out = Vec::with_capacity(max_samples);
+    let mut right_out = Vec::with_capacity(max_samples);
+
+    let vel_midi = (velocity.clamp(0.0, 1.0) * 127.0) as u8;
+
+    // Note on
+    let rc = unsafe { auv3_note_on(handle.ptr, note, vel_midi, 0) };
+    if rc != 0 {
+        return Err(format!("MIDI note on failed: {rc}"));
+    }
+
+    // Render note-on duration
+    let mut rendered = 0;
+    let bs = BLOCK_SIZE as usize;
+    let mut lo = vec![0.0f32; bs];
+    let mut ro = vec![0.0f32; bs];
+
+    while rendered < total_samples {
+        let frames = bs.min(total_samples - rendered);
+        lo.iter_mut().for_each(|s| *s = 0.0);
+        ro.iter_mut().for_each(|s| *s = 0.0);
+
+        let rc = unsafe { auv3_render(handle.ptr, frames as u32, lo.as_mut_ptr(), ro.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(format!("Render failed: {rc}"));
+        }
+
+        left_out.extend_from_slice(&lo[..frames]);
+        right_out.extend_from_slice(&ro[..frames]);
+        rendered += frames;
+    }
+
+    // Note off
+    unsafe { auv3_note_off(handle.ptr, note, 64, 0); }
+
+    // Render release tail
+    let silence_threshold = 1e-6_f32;
+    let mut silent_blocks = 0;
+
+    while rendered < max_samples && silent_blocks < 10 {
+        let frames = bs.min(max_samples - rendered);
+        lo.iter_mut().for_each(|s| *s = 0.0);
+        ro.iter_mut().for_each(|s| *s = 0.0);
+
+        let rc = unsafe { auv3_render(handle.ptr, frames as u32, lo.as_mut_ptr(), ro.as_mut_ptr()) };
+        if rc != 0 { break; }
+
+        let rms: f32 = lo[..frames].iter().chain(ro[..frames].iter())
+            .map(|s| s * s).sum::<f32>() / (frames * 2) as f32;
+
+        if rms < silence_threshold { silent_blocks += 1; } else { silent_blocks = 0; }
+
+        left_out.extend_from_slice(&lo[..frames]);
+        right_out.extend_from_slice(&ro[..frames]);
+        rendered += frames;
+    }
+
+    Ok((left_out, right_out))
+}
+
+fn encode_audio_response(request_id: u32, left: &[f32], right: &[f32]) -> Vec<u8> {
+    let num_samples = left.len() as u32;
+    let mut buf = Vec::with_capacity(8 + (left.len() + right.len()) * 4);
+    buf.extend_from_slice(&request_id.to_le_bytes());
+    buf.extend_from_slice(&num_samples.to_le_bytes());
+    for s in left { buf.extend_from_slice(&s.to_le_bytes()); }
+    for s in right { buf.extend_from_slice(&s.to_le_bytes()); }
+    buf
+}
+
+// GUI requests are now dispatched directly via auv3_show_gui_async (uses dispatch_async to main queue)
+
+// ─── WebSocket server ───────────────────────────────────────────────────────
+
+async fn handle_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    manager: Arc<Mutex<PluginManager>>,
+) {
+    info!("New connection from {addr}");
+
+    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+        Ok(ws) => ws,
+        Err(e) => { error!("WebSocket handshake failed: {e}"); return; }
+    };
+
+    let (mut write, mut read) = ws_stream.split();
+
+    while let Some(msg) = read.next().await {
+        let msg = match msg {
+            Ok(m) => m,
+            Err(e) => { warn!("Read error: {e}"); break; }
+        };
+
+        match msg {
+            Message::Text(text) => {
+                let incoming: IncomingMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let err = ErrorMsg { msg_type: "error", plugin_id: None, request_id: None, message: format!("Invalid: {e}") };
+                        let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                        continue;
+                    }
+                };
+
+                match incoming {
+                    IncomingMessage::LoadPlugin { plugin_id, .. } => {
+                        let mut mgr = manager.lock().await;
+                        match mgr.load_plugin(&plugin_id) {
+                            Ok(msg) => { let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await; }
+                            Err(e) => {
+                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: None, message: e };
+                                let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                            }
+                        }
+                    }
+
+                    IncomingMessage::Render { request_id, plugin_id, note, velocity, duration, params } => {
+                        // Auto-load plugin on first render if not loaded
+                        let plugin_arc = {
+                            let mut mgr = manager.lock().await;
+                            if mgr.get_plugin(&plugin_id).is_none() {
+                                info!("Auto-loading plugin for render: {plugin_id}");
+                                if let Err(e) = mgr.load_plugin(&plugin_id) {
+                                    let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: e };
+                                    let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                                    continue;
+                                }
+                            }
+                            mgr.get_plugin(&plugin_id)
+                        };
+
+                        match plugin_arc {
+                            Some(plugin_mutex) => {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    let handle = plugin_mutex.lock().unwrap();
+                                    render_note(&handle, note, velocity, duration, &params)
+                                }).await;
+
+                                match result {
+                                    Ok(Ok((left, right))) => {
+                                        let binary = encode_audio_response(request_id, &left, &right);
+                                        let _ = write.send(Message::Binary(binary)).await;
+                                    }
+                                    Ok(Err(e)) => {
+                                        error!("Render failed: {e}");
+                                        let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: e };
+                                        let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                                    }
+                                    Err(e) => {
+                                        let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: format!("Panic: {e}") };
+                                        let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                                    }
+                                }
+                            }
+                            None => {
+                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: Some(request_id), message: format!("Failed to load: {plugin_id}") };
+                                let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                            }
+                        }
+                    }
+
+                    IncomingMessage::ShowGui { plugin_id } => {
+                        // Auto-load plugin if not loaded
+                        let plugin_arc = {
+                            let mut mgr = manager.lock().await;
+                            if mgr.get_plugin(&plugin_id).is_none() {
+                                info!("Auto-loading plugin for GUI: {plugin_id}");
+                                let _ = mgr.load_plugin(&plugin_id);
+                            }
+                            mgr.get_plugin(&plugin_id)
+                        };
+                        match plugin_arc {
+                            Some(plugin) => {
+                                info!("Opening GUI for: {plugin_id}");
+                                {
+                                    let handle = plugin.lock().unwrap();
+                                    unsafe { auv3_show_gui_async(handle.ptr); }
+                                }
+                                let msg = GuiOpenedMsg { msg_type: "gui_opened", plugin_id };
+                                let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                            }
+                            None => {
+                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: None, message: format!("Failed to load: {plugin_id}") };
+                                let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                            }
+                        }
+                    }
+
+                    IncomingMessage::ListPlugins => {
+                        let mut infos = vec![AUv3PluginInfoC {
+                            name: [0u8; 256],
+                            manufacturer: [0u8; 256],
+                            plugin_type: [0u8; 32],
+                        }; 512];
+                        let count = unsafe { auv3_list_plugins(infos.as_mut_ptr(), 512) } as usize;
+
+                        #[derive(Serialize)]
+                        struct ListMsg {
+                            #[serde(rename = "type")]
+                            msg_type: &'static str,
+                            plugins: Vec<PluginEntry>,
+                        }
+                        #[derive(Serialize)]
+                        struct PluginEntry {
+                            name: String,
+                            manufacturer: String,
+                            #[serde(rename = "pluginType")]
+                            plugin_type: String,
+                        }
+
+                        let plugins: Vec<PluginEntry> = infos[..count].iter().map(|i| PluginEntry {
+                            name: c_str(&i.name),
+                            manufacturer: c_str(&i.manufacturer),
+                            plugin_type: c_str(&i.plugin_type),
+                        }).collect();
+
+                        let msg = ListMsg { msg_type: "plugin_list", plugins };
+                        let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                    }
+                }
+            }
+            Message::Close(_) => { info!("Connection closed: {addr}"); break; }
+            _ => {}
+        }
+    }
+}
+
+// ─── Main ───────────────────────────────────────────────────────────────────
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let addr = "127.0.0.1:8765";
+
+    let manager = Arc::new(Mutex::new(PluginManager::new()));
+
+    // Spawn tokio on background thread
+    let manager_clone = manager.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = TcpListener::bind(addr).await.unwrap();
+            info!("strudel-vst-bridge listening on ws://{addr} (AUv3 backend)");
+            info!("Usage: note(\"c3 e3 g3\").vst(\"Odin2\")");
+            info!("GUI:   vstGui(\"Odin2\")");
+
+            loop {
+                let (stream, addr) = listener.accept().await.unwrap();
+                let manager = manager_clone.clone();
+                tokio::spawn(handle_connection(stream, addr, manager));
+            }
+        });
+    });
+
+    // Main thread: run macOS NSApp event loop (never returns)
+    // This is required for JUCE plugin GUIs — modal dialogs, dropdown menus etc.
+    // GUI requests are dispatched via dispatch_async(dispatch_get_main_queue()) from auv3_show_gui_async
+    info!("Main thread running NSApp event loop for GUI support");
+    unsafe { auv3_run_main_loop(); }
+
+    // unreachable
+    Ok(())
+}
