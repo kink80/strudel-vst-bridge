@@ -374,6 +374,81 @@ fn render_note(
     Ok((left_out, right_out))
 }
 
+fn render_note_vst3(
+    handle: &mut Vst3PluginHandle,
+    note: u8,
+    velocity: f32,
+    duration_secs: f32,
+    _params: &HashMap<String, f32>,
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let total_samples = (duration_secs * SAMPLE_RATE as f32) as usize;
+    let release_samples = (2.0 * SAMPLE_RATE as f32) as usize;
+    let max_samples = total_samples + release_samples;
+
+    let mut left_out = Vec::with_capacity(max_samples);
+    let mut right_out = Vec::with_capacity(max_samples);
+
+    let vel_midi = (velocity.clamp(0.0, 1.0) * 127.0) as u8;
+    let bs = BLOCK_SIZE as usize;
+
+    // Note on
+    handle.plugin.send_midi(&[MidiEvent::note_on(note, vel_midi, 0, 0)])
+        .map_err(|e| format!("MIDI note on failed: {e}"))?;
+
+    // Render note-on duration
+    let mut rendered = 0;
+    let mut lo = vec![0.0f32; bs];
+    let mut ro = vec![0.0f32; bs];
+
+    while rendered < total_samples {
+        let frames = bs.min(total_samples - rendered);
+        lo.iter_mut().for_each(|s| *s = 0.0);
+        ro.iter_mut().for_each(|s| *s = 0.0);
+
+        {
+            let mut outputs: [&mut [f32]; 2] = [&mut lo[..frames], &mut ro[..frames]];
+            handle.plugin.process(&[], &mut outputs, frames)
+                .map_err(|e| format!("Render failed: {e}"))?;
+        }
+
+        left_out.extend_from_slice(&lo[..frames]);
+        right_out.extend_from_slice(&ro[..frames]);
+        rendered += frames;
+    }
+
+    // Note off
+    handle.plugin.send_midi(&[MidiEvent::note_off(note, 64, 0, 0)])
+        .map_err(|e| format!("MIDI note off failed: {e}"))?;
+
+    // Render release tail
+    let silence_threshold = 1e-6_f32;
+    let mut silent_blocks = 0;
+
+    while rendered < max_samples && silent_blocks < 10 {
+        let frames = bs.min(max_samples - rendered);
+        lo.iter_mut().for_each(|s| *s = 0.0);
+        ro.iter_mut().for_each(|s| *s = 0.0);
+
+        {
+            let mut outputs: [&mut [f32]; 2] = [&mut lo[..frames], &mut ro[..frames]];
+            if handle.plugin.process(&[], &mut outputs, frames).is_err() {
+                break;
+            }
+        }
+
+        let rms: f32 = lo[..frames].iter().chain(ro[..frames].iter())
+            .map(|s| s * s).sum::<f32>() / (frames * 2) as f32;
+
+        if rms < silence_threshold { silent_blocks += 1; } else { silent_blocks = 0; }
+
+        left_out.extend_from_slice(&lo[..frames]);
+        right_out.extend_from_slice(&ro[..frames]);
+        rendered += frames;
+    }
+
+    Ok((left_out, right_out))
+}
+
 fn encode_audio_response(request_id: u32, left: &[f32], right: &[f32]) -> Vec<u8> {
     let num_samples = left.len() as u32;
     let mut buf = Vec::with_capacity(8 + (left.len() + right.len()) * 4);
