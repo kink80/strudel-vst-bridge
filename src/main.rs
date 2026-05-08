@@ -169,17 +169,55 @@ struct GuiOpenedMsg {
 // ─── Plugin manager ─────────────────────────────────────────────────────────
 
 struct PluginManager {
-    plugins: HashMap<String, Arc<StdMutex<PluginHandle>>>,
+    au_plugins: HashMap<String, Arc<StdMutex<PluginHandle>>>,
+    vst3_plugins: HashMap<String, Arc<StdMutex<Vst3PluginHandle>>>,
+    vst3_scanner: Option<Vst3Scanner>,
+    vst3_catalog: Vec<RackPluginInfo>,
 }
 
 impl PluginManager {
     fn new() -> Self {
-        Self { plugins: HashMap::new() }
+        // Initialize VST3 scanner, log warning if it fails
+        let (vst3_scanner, vst3_catalog) = match Vst3Scanner::new() {
+            Ok(scanner) => {
+                let catalog = match scanner.scan() {
+                    Ok(plugins) => {
+                        info!("Found {} VST3 plugins", plugins.len());
+                        plugins
+                    }
+                    Err(e) => {
+                        warn!("VST3 scan failed: {e}");
+                        Vec::new()
+                    }
+                };
+                (Some(scanner), catalog)
+            }
+            Err(e) => {
+                warn!("VST3 scanner init failed: {e}");
+                (None, Vec::new())
+            }
+        };
+
+        Self {
+            au_plugins: HashMap::new(),
+            vst3_plugins: HashMap::new(),
+            vst3_scanner,
+            vst3_catalog,
+        }
     }
 
     fn load_plugin(&mut self, plugin_id: &str) -> Result<PluginLoadedMsg, String> {
-        if self.plugins.contains_key(plugin_id) {
-            let handle = self.plugins.get(plugin_id).unwrap().lock().unwrap();
+        let (name, format) = parse_plugin_format(plugin_id);
+
+        match format {
+            "vst3" => self.load_vst3_plugin(plugin_id, name),
+            _ => self.load_au_plugin(plugin_id, name),
+        }
+    }
+
+    fn load_au_plugin(&mut self, plugin_id: &str, name: &str) -> Result<PluginLoadedMsg, String> {
+        if self.au_plugins.contains_key(plugin_id) {
+            let handle = self.au_plugins.get(plugin_id).unwrap().lock().unwrap();
             return Ok(PluginLoadedMsg {
                 msg_type: "plugin_loaded",
                 plugin_id: plugin_id.to_string(),
@@ -188,32 +226,78 @@ impl PluginManager {
             });
         }
 
-        let c_name = CString::new(plugin_id).map_err(|e| format!("Invalid name: {e}"))?;
+        let c_name = CString::new(name).map_err(|e| format!("Invalid name: {e}"))?;
         let ptr = unsafe { auv3_load_plugin(c_name.as_ptr(), SAMPLE_RATE, BLOCK_SIZE) };
         if ptr.is_null() {
-            return Err(format!("Failed to load plugin: {plugin_id}"));
+            return Err(format!("Failed to load AU plugin: {name}"));
         }
 
-        let name = unsafe {
+        let actual_name = unsafe {
             let cstr = auv3_get_name(ptr);
             CStr::from_ptr(cstr).to_string_lossy().to_string()
         };
 
-        info!("Plugin loaded: {} (via AUv3)", name);
+        info!("Plugin loaded: {} (via AUv3)", actual_name);
 
-        let handle = PluginHandle { ptr, name: name.clone() };
-        self.plugins.insert(plugin_id.to_string(), Arc::new(StdMutex::new(handle)));
+        let handle = PluginHandle { ptr, name: actual_name.clone() };
+        self.au_plugins.insert(plugin_id.to_string(), Arc::new(StdMutex::new(handle)));
 
         Ok(PluginLoadedMsg {
             msg_type: "plugin_loaded",
             plugin_id: plugin_id.to_string(),
-            name,
+            name: actual_name,
             params: vec![],
         })
     }
 
-    fn get_plugin(&self, plugin_id: &str) -> Option<Arc<StdMutex<PluginHandle>>> {
-        self.plugins.get(plugin_id).cloned()
+    fn load_vst3_plugin(&mut self, plugin_id: &str, name: &str) -> Result<PluginLoadedMsg, String> {
+        if self.vst3_plugins.contains_key(plugin_id) {
+            let handle = self.vst3_plugins.get(plugin_id).unwrap().lock().unwrap();
+            return Ok(PluginLoadedMsg {
+                msg_type: "plugin_loaded",
+                plugin_id: plugin_id.to_string(),
+                name: handle.name.clone(),
+                params: vec![],
+            });
+        }
+
+        let scanner = self.vst3_scanner.as_ref()
+            .ok_or_else(|| "VST3 scanner not available".to_string())?;
+
+        let info = self.vst3_catalog.iter()
+            .find(|p| p.name == name)
+            .ok_or_else(|| format!("VST3 plugin not found: {name}"))?
+            .clone();
+
+        let mut plugin = scanner.load(&info)
+            .map_err(|e| format!("Failed to load VST3 plugin {name}: {e}"))?;
+
+        plugin.initialize(SAMPLE_RATE, BLOCK_SIZE as usize)
+            .map_err(|e| format!("Failed to initialize VST3 plugin {name}: {e}"))?;
+
+        info!("Plugin loaded: {} (via VST3)", name);
+
+        let handle = Vst3PluginHandle {
+            plugin,
+            name: name.to_string(),
+            info,
+        };
+        self.vst3_plugins.insert(plugin_id.to_string(), Arc::new(StdMutex::new(handle)));
+
+        Ok(PluginLoadedMsg {
+            msg_type: "plugin_loaded",
+            plugin_id: plugin_id.to_string(),
+            name: name.to_string(),
+            params: vec![],
+        })
+    }
+
+    fn get_au_plugin(&self, plugin_id: &str) -> Option<Arc<StdMutex<PluginHandle>>> {
+        self.au_plugins.get(plugin_id).cloned()
+    }
+
+    fn get_vst3_plugin(&self, plugin_id: &str) -> Option<Arc<StdMutex<Vst3PluginHandle>>> {
+        self.vst3_plugins.get(plugin_id).cloned()
     }
 }
 
