@@ -635,6 +635,7 @@ async fn handle_connection(
                     }
 
                     IncomingMessage::ListPlugins => {
+                        // AU plugins
                         let mut infos = vec![AUv3PluginInfoC {
                             name: [0u8; 256],
                             manufacturer: [0u8; 256],
@@ -654,13 +655,31 @@ async fn handle_connection(
                             manufacturer: String,
                             #[serde(rename = "pluginType")]
                             plugin_type: String,
+                            format: String,
                         }
 
-                        let plugins: Vec<PluginEntry> = infos[..count].iter().map(|i| PluginEntry {
-                            name: c_str(&i.name),
+                        let mut plugins: Vec<PluginEntry> = infos[..count].iter().map(|i| PluginEntry {
+                            name: format!("{} (AU)", c_str(&i.name)),
                             manufacturer: c_str(&i.manufacturer),
                             plugin_type: c_str(&i.plugin_type),
+                            format: "au".to_string(),
                         }).collect();
+
+                        // VST3 plugins
+                        let mgr = manager.lock().await;
+                        for info in &mgr.vst3_catalog {
+                            let plugin_type = match info.plugin_type {
+                                RackPluginType::Instrument => "Instrument",
+                                RackPluginType::Effect => "Effect",
+                                _ => "Other",
+                            };
+                            plugins.push(PluginEntry {
+                                name: format!("{} (VST3)", info.name),
+                                manufacturer: info.manufacturer.clone(),
+                                plugin_type: plugin_type.to_string(),
+                                format: "vst3".to_string(),
+                            });
+                        }
 
                         let msg = ListMsg { msg_type: "plugin_list", plugins };
                         let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
@@ -688,7 +707,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let listener = TcpListener::bind(addr).await.unwrap();
-            info!("strudel-vst-bridge listening on ws://{addr} (AUv3 backend)");
+            info!("strudel-vst-bridge listening on ws://{addr} (AU + VST3 backends)");
             info!("Usage: note(\"c3 e3 g3\").vst(\"Odin2\")");
             info!("GUI:   vstGui(\"Odin2\")");
 
