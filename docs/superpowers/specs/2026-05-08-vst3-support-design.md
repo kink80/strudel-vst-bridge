@@ -174,7 +174,7 @@ No changes to the threading model:
 ### 9. What's NOT in Scope
 
 - Migrating AU hosting to `rack` (keep `auv3_host.m` as-is)
-- Windows/Linux support (future work, but this design doesn't preclude it)
+- Windows/Linux support (future work — the current bridge is macOS-only due to `auv3_host.m`, `NSApp` event loop, and macOS framework linkage; cross-platform would require `#[cfg]` gates, platform-specific event loops, and per-platform VST3 GUI embedding)
 - CLAP support (rack doesn't have it yet)
 - Deduplication of AU/VST3 plugins with same name
 - Preset management UI
