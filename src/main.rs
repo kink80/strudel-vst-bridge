@@ -69,15 +69,9 @@ impl Drop for PluginHandle {
     }
 }
 
-enum LoadedPlugin {
-    Au(Arc<StdMutex<PluginHandle>>),
-    Vst3(Arc<StdMutex<Vst3PluginHandle>>),
-}
-
 struct Vst3PluginHandle {
     plugin: Vst3Plugin,
     name: String,
-    info: RackPluginInfo,
 }
 
 unsafe impl Send for Vst3PluginHandle {}
@@ -280,7 +274,6 @@ impl PluginManager {
         let handle = Vst3PluginHandle {
             plugin,
             name: name.to_string(),
-            info,
         };
         self.vst3_plugins.insert(plugin_id.to_string(), Arc::new(StdMutex::new(handle)));
 
