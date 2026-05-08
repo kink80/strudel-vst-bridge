@@ -507,10 +507,17 @@ async fn handle_connection(
                     }
 
                     IncomingMessage::Render { request_id, plugin_id, note, velocity, duration, params } => {
+                        let (_, format) = parse_plugin_format(&plugin_id);
+                        let format = format.to_string();
+
                         // Auto-load plugin on first render if not loaded
-                        let plugin_arc = {
+                        {
                             let mut mgr = manager.lock().await;
-                            if mgr.get_plugin(&plugin_id).is_none() {
+                            let needs_load = match format.as_str() {
+                                "vst3" => mgr.get_vst3_plugin(&plugin_id).is_none(),
+                                _ => mgr.get_au_plugin(&plugin_id).is_none(),
+                            };
+                            if needs_load {
                                 info!("Auto-loading plugin for render: {plugin_id}");
                                 if let Err(e) = mgr.load_plugin(&plugin_id) {
                                     let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: e };
@@ -518,62 +525,111 @@ async fn handle_connection(
                                     continue;
                                 }
                             }
-                            mgr.get_plugin(&plugin_id)
-                        };
+                        }
 
-                        match plugin_arc {
-                            Some(plugin_mutex) => {
-                                let result = tokio::task::spawn_blocking(move || {
-                                    let handle = plugin_mutex.lock().unwrap();
-                                    render_note(&handle, note, velocity, duration, &params)
-                                }).await;
-
-                                match result {
-                                    Ok(Ok((left, right))) => {
-                                        let binary = encode_audio_response(request_id, &left, &right);
-                                        let _ = write.send(Message::Binary(binary)).await;
+                        let result = match format.as_str() {
+                            "vst3" => {
+                                let plugin_arc = {
+                                    let mgr = manager.lock().await;
+                                    mgr.get_vst3_plugin(&plugin_id)
+                                };
+                                match plugin_arc {
+                                    Some(plugin_mutex) => {
+                                        tokio::task::spawn_blocking(move || {
+                                            let mut handle = plugin_mutex.lock().unwrap();
+                                            render_note_vst3(&mut handle, note, velocity, duration, &params)
+                                        }).await
                                     }
-                                    Ok(Err(e)) => {
-                                        error!("Render failed: {e}");
-                                        let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: e };
+                                    None => {
+                                        let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: Some(request_id), message: format!("Failed to load: {plugin_id}") };
                                         let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
-                                    }
-                                    Err(e) => {
-                                        let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: format!("Panic: {e}") };
-                                        let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                                        continue;
                                     }
                                 }
                             }
-                            None => {
-                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: Some(request_id), message: format!("Failed to load: {plugin_id}") };
+                            _ => {
+                                let plugin_arc = {
+                                    let mgr = manager.lock().await;
+                                    mgr.get_au_plugin(&plugin_id)
+                                };
+                                match plugin_arc {
+                                    Some(plugin_mutex) => {
+                                        tokio::task::spawn_blocking(move || {
+                                            let handle = plugin_mutex.lock().unwrap();
+                                            render_note(&handle, note, velocity, duration, &params)
+                                        }).await
+                                    }
+                                    None => {
+                                        let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: Some(request_id), message: format!("Failed to load: {plugin_id}") };
+                                        let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+
+                        match result {
+                            Ok(Ok((left, right))) => {
+                                let binary = encode_audio_response(request_id, &left, &right);
+                                let _ = write.send(Message::Binary(binary)).await;
+                            }
+                            Ok(Err(e)) => {
+                                error!("Render failed: {e}");
+                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: e };
+                                let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                            }
+                            Err(e) => {
+                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: format!("Panic: {e}") };
                                 let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
                             }
                         }
                     }
 
                     IncomingMessage::ShowGui { plugin_id } => {
+                        let (_, format) = parse_plugin_format(&plugin_id);
+                        let format = format.to_string();
+
                         // Auto-load plugin if not loaded
-                        let plugin_arc = {
+                        {
                             let mut mgr = manager.lock().await;
-                            if mgr.get_plugin(&plugin_id).is_none() {
+                            let needs_load = match format.as_str() {
+                                "vst3" => mgr.get_vst3_plugin(&plugin_id).is_none(),
+                                _ => mgr.get_au_plugin(&plugin_id).is_none(),
+                            };
+                            if needs_load {
                                 info!("Auto-loading plugin for GUI: {plugin_id}");
                                 let _ = mgr.load_plugin(&plugin_id);
                             }
-                            mgr.get_plugin(&plugin_id)
-                        };
-                        match plugin_arc {
-                            Some(plugin) => {
-                                info!("Opening GUI for: {plugin_id}");
-                                {
-                                    let handle = plugin.lock().unwrap();
-                                    unsafe { auv3_show_gui_async(handle.ptr); }
-                                }
-                                let msg = GuiOpenedMsg { msg_type: "gui_opened", plugin_id };
-                                let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
-                            }
-                            None => {
-                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: None, message: format!("Failed to load: {plugin_id}") };
+                        }
+
+                        match format.as_str() {
+                            "vst3" => {
+                                // VST3 GUI not yet implemented in rack
+                                let err = ErrorMsg {
+                                    msg_type: "error",
+                                    plugin_id: Some(plugin_id),
+                                    request_id: None,
+                                    message: "VST3 GUI not yet supported".to_string(),
+                                };
                                 let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                            }
+                            _ => {
+                                let mgr = manager.lock().await;
+                                match mgr.get_au_plugin(&plugin_id) {
+                                    Some(plugin) => {
+                                        info!("Opening GUI for: {plugin_id}");
+                                        {
+                                            let handle = plugin.lock().unwrap();
+                                            unsafe { auv3_show_gui_async(handle.ptr); }
+                                        }
+                                        let msg = GuiOpenedMsg { msg_type: "gui_opened", plugin_id };
+                                        let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                                    }
+                                    None => {
+                                        let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: None, message: format!("Failed to load: {plugin_id}") };
+                                        let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                                    }
+                                }
                             }
                         }
                     }
