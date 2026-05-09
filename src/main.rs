@@ -77,6 +77,8 @@ enum IncomingMessage {
     LoadPlugin {
         #[serde(rename = "pluginId")]
         plugin_id: String,
+        #[serde(rename = "pluginName")]
+        plugin_name: Option<String>,
         path: Option<String>,
     },
     #[serde(rename = "render")]
@@ -151,7 +153,7 @@ impl PluginManager {
         Self { plugins: HashMap::new() }
     }
 
-    fn load_plugin(&mut self, plugin_id: &str) -> Result<PluginLoadedMsg, String> {
+    fn load_plugin(&mut self, plugin_id: &str, plugin_name: &str) -> Result<PluginLoadedMsg, String> {
         if self.plugins.contains_key(plugin_id) {
             let handle = self.plugins.get(plugin_id).unwrap().lock().unwrap();
             return Ok(PluginLoadedMsg {
@@ -162,10 +164,10 @@ impl PluginManager {
             });
         }
 
-        let c_name = CString::new(plugin_id).map_err(|e| format!("Invalid name: {e}"))?;
+        let c_name = CString::new(plugin_name).map_err(|e| format!("Invalid name: {e}"))?;
         let ptr = unsafe { auv3_load_plugin(c_name.as_ptr(), SAMPLE_RATE, BLOCK_SIZE) };
         if ptr.is_null() {
-            return Err(format!("Failed to load plugin: {plugin_id}"));
+            return Err(format!("Failed to load plugin: {plugin_name}"));
         }
 
         let name = unsafe {
@@ -173,7 +175,7 @@ impl PluginManager {
             CStr::from_ptr(cstr).to_string_lossy().to_string()
         };
 
-        info!("Plugin loaded: {} (via AUv3)", name);
+        info!("Plugin loaded: {} as instance '{}'", name, plugin_id);
 
         let handle = PluginHandle { ptr, name: name.clone() };
         self.plugins.insert(plugin_id.to_string(), Arc::new(StdMutex::new(handle)));
@@ -310,9 +312,14 @@ async fn handle_connection(
                 };
 
                 match incoming {
-                    IncomingMessage::LoadPlugin { plugin_id, .. } => {
+                    IncomingMessage::LoadPlugin { plugin_id, plugin_name, path } => {
+                        let load_name = plugin_name
+                            .or(path)
+                            .unwrap_or_else(|| {
+                                plugin_id.split(':').next().unwrap_or(&plugin_id).to_string()
+                            });
                         let mut mgr = manager.lock().await;
-                        match mgr.load_plugin(&plugin_id) {
+                        match mgr.load_plugin(&plugin_id, &load_name) {
                             Ok(msg) => { let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await; }
                             Err(e) => {
                                 let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: None, message: e };
@@ -326,8 +333,9 @@ async fn handle_connection(
                         let plugin_arc = {
                             let mut mgr = manager.lock().await;
                             if mgr.get_plugin(&plugin_id).is_none() {
-                                info!("Auto-loading plugin for render: {plugin_id}");
-                                if let Err(e) = mgr.load_plugin(&plugin_id) {
+                                let load_name = plugin_id.split(':').next().unwrap_or(&plugin_id).to_string();
+                                info!("Auto-loading plugin for render: {plugin_id} (name: {load_name})");
+                                if let Err(e) = mgr.load_plugin(&plugin_id, &load_name) {
                                     let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: e };
                                     let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
                                     continue;
@@ -371,8 +379,9 @@ async fn handle_connection(
                         let plugin_arc = {
                             let mut mgr = manager.lock().await;
                             if mgr.get_plugin(&plugin_id).is_none() {
-                                info!("Auto-loading plugin for GUI: {plugin_id}");
-                                let _ = mgr.load_plugin(&plugin_id);
+                                let load_name = plugin_id.split(':').next().unwrap_or(&plugin_id).to_string();
+                                info!("Auto-loading plugin for GUI: {plugin_id} (name: {load_name})");
+                                let _ = mgr.load_plugin(&plugin_id, &load_name);
                             }
                             mgr.get_plugin(&plugin_id)
                         };
