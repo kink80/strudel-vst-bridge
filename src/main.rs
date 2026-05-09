@@ -172,13 +172,13 @@ impl PluginManager {
         Ok(())
     }
 
-    fn delete_instance(&mut self, label: &str) -> bool {
-        if self.instances.remove(label).is_some() {
-            info!("Instance deleted: '{}'", label);
-            true
-        } else {
-            false
+    /// Remove an instance from the registry, returning the handle for deferred destruction.
+    fn delete_instance(&mut self, label: &str) -> Option<InstanceInfo> {
+        let removed = self.instances.remove(label);
+        if removed.is_some() {
+            info!("Instance removed from registry: '{}'", label);
         }
+        removed
     }
 
     fn get_instance(&self, label: &str) -> Option<Arc<StdMutex<PluginHandle>>> {
@@ -322,12 +322,18 @@ async fn handle_connection(
                     }
 
                     IncomingMessage::DeleteInstance { label } => {
-                        let mut mgr = manager.lock().await;
-                        mgr.delete_instance(&label);
+                        // Remove from registry under lock, then drop handle outside
+                        let removed = {
+                            let mut mgr = manager.lock().await;
+                            mgr.delete_instance(&label)
+                        };
+                        // Send response before destroying plugin (which may block)
                         #[derive(Serialize)]
                         struct Msg { #[serde(rename = "type")] msg_type: &'static str, label: String }
                         let msg = Msg { msg_type: "instance_deleted", label };
                         let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                        // Plugin handle drops here — auv3_destroy_plugin runs outside the lock
+                        drop(removed);
                     }
 
                     IncomingMessage::ListInstances => {
