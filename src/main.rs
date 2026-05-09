@@ -316,7 +316,7 @@ async fn handle_connection(
                         let load_name = plugin_name
                             .or(path)
                             .unwrap_or_else(|| {
-                                plugin_id.split(':').next().unwrap_or(&plugin_id).to_string()
+                                plugin_id.split("__").next().unwrap_or(&plugin_id).to_string()
                             });
                         let mut mgr = manager.lock().await;
                         match mgr.load_plugin(&plugin_id, &load_name) {
@@ -333,7 +333,7 @@ async fn handle_connection(
                         let plugin_arc = {
                             let mut mgr = manager.lock().await;
                             if mgr.get_plugin(&plugin_id).is_none() {
-                                let load_name = plugin_id.split(':').next().unwrap_or(&plugin_id).to_string();
+                                let load_name = plugin_id.split("__").next().unwrap_or(&plugin_id).to_string();
                                 info!("Auto-loading plugin for render: {plugin_id} (name: {load_name})");
                                 if let Err(e) = mgr.load_plugin(&plugin_id, &load_name) {
                                     let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: e };
@@ -379,7 +379,7 @@ async fn handle_connection(
                         let plugin_arc = {
                             let mut mgr = manager.lock().await;
                             if mgr.get_plugin(&plugin_id).is_none() {
-                                let load_name = plugin_id.split(':').next().unwrap_or(&plugin_id).to_string();
+                                let load_name = plugin_id.split("__").next().unwrap_or(&plugin_id).to_string();
                                 info!("Auto-loading plugin for GUI: {plugin_id} (name: {load_name})");
                                 let _ = mgr.load_plugin(&plugin_id, &load_name);
                             }
