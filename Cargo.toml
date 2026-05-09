@@ -2,10 +2,9 @@
 name = "strudel-vst-bridge"
 version = "0.1.0"
 edition = "2021"
-description = "WebSocket bridge between strudel and VST3/AU plugins"
+description = "WebSocket bridge between strudel and AU plugins"
 
 [dependencies]
-rack = { path = "../rack-patched" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
