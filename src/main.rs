@@ -66,21 +66,23 @@ impl Drop for PluginHandle {
     }
 }
 
-// macOS event loop handled by auv3_pump_events() in auv3_host.m
-
 // ─── Protocol types ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
 enum IncomingMessage {
-    #[serde(rename = "load_plugin")]
-    LoadPlugin {
-        #[serde(rename = "pluginId")]
-        plugin_id: String,
+    #[serde(rename = "create_instance")]
+    CreateInstance {
+        label: String,
         #[serde(rename = "pluginName")]
-        plugin_name: Option<String>,
-        path: Option<String>,
+        plugin_name: String,
     },
+    #[serde(rename = "delete_instance")]
+    DeleteInstance {
+        label: String,
+    },
+    #[serde(rename = "list_instances")]
+    ListInstances,
     #[serde(rename = "render")]
     Render {
         #[serde(rename = "requestId")]
@@ -108,22 +110,6 @@ fn default_velocity() -> f32 { 0.8 }
 fn default_duration() -> f32 { 1.0 }
 
 #[derive(Serialize)]
-struct PluginLoadedMsg {
-    #[serde(rename = "type")]
-    msg_type: &'static str,
-    #[serde(rename = "pluginId")]
-    plugin_id: String,
-    name: String,
-    params: Vec<ParamInfoMsg>,
-}
-
-#[derive(Serialize)]
-struct ParamInfoMsg {
-    index: usize,
-    name: String,
-}
-
-#[derive(Serialize)]
 struct ErrorMsg {
     #[serde(rename = "type")]
     msg_type: &'static str,
@@ -142,26 +128,26 @@ struct GuiOpenedMsg {
     plugin_id: String,
 }
 
-// ─── Plugin manager ─────────────────────────────────────────────────────────
+// ─── Plugin manager with instance registry ─────────────────────────────────
+
+struct InstanceInfo {
+    plugin_name: String,
+    handle: Arc<StdMutex<PluginHandle>>,
+}
 
 struct PluginManager {
-    plugins: HashMap<String, Arc<StdMutex<PluginHandle>>>,
+    // label -> instance (plugin handle + metadata)
+    instances: HashMap<String, InstanceInfo>,
 }
 
 impl PluginManager {
     fn new() -> Self {
-        Self { plugins: HashMap::new() }
+        Self { instances: HashMap::new() }
     }
 
-    fn load_plugin(&mut self, plugin_id: &str, plugin_name: &str) -> Result<PluginLoadedMsg, String> {
-        if self.plugins.contains_key(plugin_id) {
-            let handle = self.plugins.get(plugin_id).unwrap().lock().unwrap();
-            return Ok(PluginLoadedMsg {
-                msg_type: "plugin_loaded",
-                plugin_id: plugin_id.to_string(),
-                name: handle.name.clone(),
-                params: vec![],
-            });
+    fn create_instance(&mut self, label: &str, plugin_name: &str) -> Result<(), String> {
+        if self.instances.contains_key(label) {
+            return Err(format!("Instance '{}' already exists", label));
         }
 
         let c_name = CString::new(plugin_name).map_err(|e| format!("Invalid name: {e}"))?;
@@ -175,21 +161,34 @@ impl PluginManager {
             CStr::from_ptr(cstr).to_string_lossy().to_string()
         };
 
-        info!("Plugin loaded: {} as instance '{}'", name, plugin_id);
+        info!("Instance created: '{}' -> {} ({})", label, name, plugin_name);
 
-        let handle = PluginHandle { ptr, name: name.clone() };
-        self.plugins.insert(plugin_id.to_string(), Arc::new(StdMutex::new(handle)));
+        let handle = PluginHandle { ptr, name };
+        self.instances.insert(label.to_string(), InstanceInfo {
+            plugin_name: plugin_name.to_string(),
+            handle: Arc::new(StdMutex::new(handle)),
+        });
 
-        Ok(PluginLoadedMsg {
-            msg_type: "plugin_loaded",
-            plugin_id: plugin_id.to_string(),
-            name,
-            params: vec![],
-        })
+        Ok(())
     }
 
-    fn get_plugin(&self, plugin_id: &str) -> Option<Arc<StdMutex<PluginHandle>>> {
-        self.plugins.get(plugin_id).cloned()
+    fn delete_instance(&mut self, label: &str) -> bool {
+        if self.instances.remove(label).is_some() {
+            info!("Instance deleted: '{}'", label);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn get_instance(&self, label: &str) -> Option<Arc<StdMutex<PluginHandle>>> {
+        self.instances.get(label).map(|i| i.handle.clone())
+    }
+
+    fn list_instances(&self) -> Vec<(String, String)> {
+        self.instances.iter()
+            .map(|(label, info)| (label.clone(), info.plugin_name.clone()))
+            .collect()
     }
 }
 
@@ -211,13 +210,11 @@ fn render_note(
 
     let vel_midi = (velocity.clamp(0.0, 1.0) * 127.0) as u8;
 
-    // Note on
     let rc = unsafe { auv3_note_on(handle.ptr, note, vel_midi, 0) };
     if rc != 0 {
         return Err(format!("MIDI note on failed: {rc}"));
     }
 
-    // Render note-on duration
     let mut rendered = 0;
     let bs = BLOCK_SIZE as usize;
     let mut lo = vec![0.0f32; bs];
@@ -238,10 +235,8 @@ fn render_note(
         rendered += frames;
     }
 
-    // Note off
     unsafe { auv3_note_off(handle.ptr, note, 64, 0); }
 
-    // Render release tail
     let silence_threshold = 1e-6_f32;
     let mut silent_blocks = 0;
 
@@ -275,8 +270,6 @@ fn encode_audio_response(request_id: u32, left: &[f32], right: &[f32]) -> Vec<u8
     for s in right { buf.extend_from_slice(&s.to_le_bytes()); }
     buf
 }
-
-// GUI requests are now dispatched directly via auv3_show_gui_async (uses dispatch_async to main queue)
 
 // ─── WebSocket server ───────────────────────────────────────────────────────
 
@@ -312,36 +305,49 @@ async fn handle_connection(
                 };
 
                 match incoming {
-                    IncomingMessage::LoadPlugin { plugin_id, plugin_name, path } => {
-                        let load_name = plugin_name
-                            .or(path)
-                            .unwrap_or_else(|| {
-                                plugin_id.split("__").next().unwrap_or(&plugin_id).to_string()
-                            });
+                    IncomingMessage::CreateInstance { label, plugin_name } => {
                         let mut mgr = manager.lock().await;
-                        match mgr.load_plugin(&plugin_id, &load_name) {
-                            Ok(msg) => { let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await; }
+                        match mgr.create_instance(&label, &plugin_name) {
+                            Ok(()) => {
+                                #[derive(Serialize)]
+                                struct Msg { #[serde(rename = "type")] msg_type: &'static str, label: String, #[serde(rename = "pluginName")] plugin_name: String, params: Vec<()> }
+                                let msg = Msg { msg_type: "instance_created", label, plugin_name, params: vec![] };
+                                let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                            }
                             Err(e) => {
-                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: None, message: e };
+                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(label), request_id: None, message: e };
                                 let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
                             }
                         }
                     }
 
+                    IncomingMessage::DeleteInstance { label } => {
+                        let mut mgr = manager.lock().await;
+                        mgr.delete_instance(&label);
+                        #[derive(Serialize)]
+                        struct Msg { #[serde(rename = "type")] msg_type: &'static str, label: String }
+                        let msg = Msg { msg_type: "instance_deleted", label };
+                        let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                    }
+
+                    IncomingMessage::ListInstances => {
+                        let mgr = manager.lock().await;
+                        let instances = mgr.list_instances();
+                        #[derive(Serialize)]
+                        struct Msg { #[serde(rename = "type")] msg_type: &'static str, instances: Vec<InstanceEntry> }
+                        #[derive(Serialize)]
+                        struct InstanceEntry { label: String, #[serde(rename = "pluginName")] plugin_name: String }
+                        let msg = Msg {
+                            msg_type: "instance_list",
+                            instances: instances.into_iter().map(|(label, plugin_name)| InstanceEntry { label, plugin_name }).collect(),
+                        };
+                        let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                    }
+
                     IncomingMessage::Render { request_id, plugin_id, note, velocity, duration, params } => {
-                        // Auto-load plugin on first render if not loaded
                         let plugin_arc = {
-                            let mut mgr = manager.lock().await;
-                            if mgr.get_plugin(&plugin_id).is_none() {
-                                let load_name = plugin_id.split("__").next().unwrap_or(&plugin_id).to_string();
-                                info!("Auto-loading plugin for render: {plugin_id} (name: {load_name})");
-                                if let Err(e) = mgr.load_plugin(&plugin_id, &load_name) {
-                                    let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: e };
-                                    let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
-                                    continue;
-                                }
-                            }
-                            mgr.get_plugin(&plugin_id)
+                            let mgr = manager.lock().await;
+                            mgr.get_instance(&plugin_id)
                         };
 
                         match plugin_arc {
@@ -368,22 +374,16 @@ async fn handle_connection(
                                 }
                             }
                             None => {
-                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: Some(request_id), message: format!("Failed to load: {plugin_id}") };
+                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: Some(request_id), message: format!("No instance: {plugin_id}") };
                                 let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
                             }
                         }
                     }
 
                     IncomingMessage::ShowGui { plugin_id } => {
-                        // Auto-load plugin if not loaded
                         let plugin_arc = {
-                            let mut mgr = manager.lock().await;
-                            if mgr.get_plugin(&plugin_id).is_none() {
-                                let load_name = plugin_id.split("__").next().unwrap_or(&plugin_id).to_string();
-                                info!("Auto-loading plugin for GUI: {plugin_id} (name: {load_name})");
-                                let _ = mgr.load_plugin(&plugin_id, &load_name);
-                            }
-                            mgr.get_plugin(&plugin_id)
+                            let mgr = manager.lock().await;
+                            mgr.get_instance(&plugin_id)
                         };
                         match plugin_arc {
                             Some(plugin) => {
@@ -396,7 +396,7 @@ async fn handle_connection(
                                 let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
                             }
                             None => {
-                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: None, message: format!("Failed to load: {plugin_id}") };
+                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: None, message: format!("No instance: {plugin_id}") };
                                 let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
                             }
                         }
@@ -450,15 +450,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let manager = Arc::new(Mutex::new(PluginManager::new()));
 
-    // Spawn tokio on background thread
     let manager_clone = manager.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let listener = TcpListener::bind(addr).await.unwrap();
             info!("strudel-vst-bridge listening on ws://{addr} (AUv3 backend)");
-            info!("Usage: note(\"c3 e3 g3\").vst(\"Odin2\")");
-            info!("GUI:   vstGui(\"Odin2\")");
+            info!("Create instances in the VST panel, then use: note(\"c3 e3\").vst(\"label\")");
 
             loop {
                 let (stream, addr) = listener.accept().await.unwrap();
@@ -468,12 +466,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // Main thread: run macOS NSApp event loop (never returns)
-    // This is required for JUCE plugin GUIs — modal dialogs, dropdown menus etc.
-    // GUI requests are dispatched via dispatch_async(dispatch_get_main_queue()) from auv3_show_gui_async
     info!("Main thread running NSApp event loop for GUI support");
     unsafe { auv3_run_main_loop(); }
 
-    // unreachable
     Ok(())
 }
