@@ -1,8 +1,43 @@
 # strudel-vst-bridge
 
-WebSocket bridge that hosts AudioUnit plugins on macOS and renders audio on demand for [strudel](https://strudel.cc) live coding.
+Use your AudioUnit synthesizer plugins (Odin2, Dexed, Vital, etc.) directly from [strudel](https://strudel.cc) live coding patterns. The bridge runs in the background on your Mac, and strudel sends it notes to render through your plugins.
 
 Works with [strudel-experiment](https://github.com/kink80/strudel-experiment) — a fork of strudel with VST/AU bridge integration.
+
+## Getting started
+
+### Option 1: Download the binary (easiest)
+
+1. Download the latest release from the [Releases page](https://github.com/kink80/strudel-vst-bridge/releases/latest)
+2. Extract and run:
+
+```bash
+tar xzf strudel-vst-bridge-macos-universal.tar.gz
+xattr -cr strudel-vst-bridge   # needed once — allows unsigned binary to run
+./strudel-vst-bridge
+```
+
+The binary works on both Apple Silicon and Intel Macs.
+
+### Option 2: Build from source
+
+```bash
+git clone https://github.com/kink80/strudel-vst-bridge.git
+cd strudel-vst-bridge
+cargo run
+```
+
+Requires Rust (install from [rustup.rs](https://rustup.rs)).
+
+### What you'll see
+
+When the bridge starts, it scans your installed AudioUnit plugins and listens on `ws://localhost:8765`. You should see your plugins listed in the terminal output.
+
+Now open [strudel-experiment](https://github.com/kink80/strudel-experiment) in your browser and try:
+
+```js
+note("c3 e3 g3 c4").vst("Odin2")
+```
 
 ## How it works
 
@@ -18,24 +53,6 @@ note("c3 e3 g3").vst("Odin2")
 ```
 
 The bridge hosts plugins via Apple's AUv3 API (`AUAudioUnit`), so the same instance handles both audio rendering and native GUI display. Audio is rendered offline (faster than realtime, ~5-7ms per note) and streamed back as PCM over WebSocket binary frames.
-
-## Requirements
-
-- macOS (AudioUnit backend)
-- Rust toolchain (`cargo`)
-- AudioUnit instrument plugins installed (e.g. Odin2, Dexed, MS-20)
-
-## Quick start
-
-```bash
-# Build and run the bridge
-cargo run
-
-# In strudel (strudel-experiment fork):
-# note("c3 e3 g3 c4").vst("Odin2")
-```
-
-The bridge listens on `ws://localhost:8765` and automatically scans for installed AudioUnit plugins on startup.
 
 ## Usage in strudel
 
@@ -94,12 +111,19 @@ Rendered audio as little-endian binary:
 
 The main thread runs `[NSApp run]` for proper macOS event handling (required for JUCE plugin GUIs — dropdowns, modal dialogs). The tokio WebSocket server runs on a background thread. GUI requests are dispatched to the main thread via `dispatch_async(dispatch_get_main_queue(), ...)`.
 
+## Troubleshooting
+
+**"macOS cannot verify the developer"** — Run `xattr -cr strudel-vst-bridge` once after downloading, or right-click the file and choose Open.
+
+**No plugins show up** — Make sure you have AudioUnit (AU) plugins installed. Most popular synths (Vital, Dexed, Odin2, Surge XT) ship with an AU version. Check that they appear in other AU hosts like GarageBand.
+
+**Connection refused in strudel** — Make sure the bridge is running before you evaluate a pattern. It should be listening on `ws://localhost:8765`.
+
 ## Known limitations
 
 - macOS only (AudioUnit backend)
 - Plugin GUI is a floating native window, not embedded in the browser
 - Some plugin presets may be silent (wavetable loading edge cases)
-- One plugin instance per name (no polyphonic multi-instance hosting yet)
 
 ## License
 
