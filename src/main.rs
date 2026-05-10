@@ -285,7 +285,9 @@ async fn handle_connection(
         Err(e) => { error!("WebSocket handshake failed: {e}"); return; }
     };
 
-    let (mut write, mut read) = ws_stream.split();
+    let (write, mut read) = ws_stream.split();
+    // Wrap writer in Arc<Mutex> so render tasks can send responses concurrently
+    let write = Arc::new(Mutex::new(write));
 
     while let Some(msg) = read.next().await {
         let msg = match msg {
@@ -299,7 +301,8 @@ async fn handle_connection(
                     Ok(m) => m,
                     Err(e) => {
                         let err = ErrorMsg { msg_type: "error", plugin_id: None, request_id: None, message: format!("Invalid: {e}") };
-                        let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                        let mut w = write.lock().await;
+                        let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
                         continue;
                     }
                 };
@@ -312,11 +315,13 @@ async fn handle_connection(
                                 #[derive(Serialize)]
                                 struct Msg { #[serde(rename = "type")] msg_type: &'static str, label: String, #[serde(rename = "pluginName")] plugin_name: String, params: Vec<()> }
                                 let msg = Msg { msg_type: "instance_created", label, plugin_name, params: vec![] };
-                                let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                                let mut w = write.lock().await;
+                                let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
                             }
                             Err(e) => {
                                 let err = ErrorMsg { msg_type: "error", plugin_id: Some(label), request_id: None, message: e };
-                                let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                                let mut w = write.lock().await;
+                                let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
                             }
                         }
                     }
@@ -331,7 +336,8 @@ async fn handle_connection(
                         #[derive(Serialize)]
                         struct Msg { #[serde(rename = "type")] msg_type: &'static str, label: String }
                         let msg = Msg { msg_type: "instance_deleted", label };
-                        let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                        let mut w = write.lock().await;
+                        let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
                         // Plugin handle drops here — auv3_destroy_plugin runs outside the lock
                         drop(removed);
                     }
@@ -347,7 +353,8 @@ async fn handle_connection(
                             msg_type: "instance_list",
                             instances: instances.into_iter().map(|(label, plugin_name)| InstanceEntry { label, plugin_name }).collect(),
                         };
-                        let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                        let mut w = write.lock().await;
+                        let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
                     }
 
                     IncomingMessage::Render { request_id, plugin_id, note, velocity, duration, params } => {
@@ -358,30 +365,36 @@ async fn handle_connection(
 
                         match plugin_arc {
                             Some(plugin_mutex) => {
-                                let result = tokio::task::spawn_blocking(move || {
-                                    let handle = plugin_mutex.lock().unwrap();
-                                    render_note(&handle, note, velocity, duration, &params)
-                                }).await;
+                                // Spawn render concurrently — don't block the message loop
+                                let write_clone = write.clone();
+                                tokio::spawn(async move {
+                                    let result = tokio::task::spawn_blocking(move || {
+                                        let handle = plugin_mutex.lock().unwrap();
+                                        render_note(&handle, note, velocity, duration, &params)
+                                    }).await;
 
-                                match result {
-                                    Ok(Ok((left, right))) => {
-                                        let binary = encode_audio_response(request_id, &left, &right);
-                                        let _ = write.send(Message::Binary(binary)).await;
+                                    let mut w = write_clone.lock().await;
+                                    match result {
+                                        Ok(Ok((left, right))) => {
+                                            let binary = encode_audio_response(request_id, &left, &right);
+                                            let _ = w.send(Message::Binary(binary)).await;
+                                        }
+                                        Ok(Err(e)) => {
+                                            error!("Render failed: {e}");
+                                            let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: e };
+                                            let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                                        }
+                                        Err(e) => {
+                                            let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: format!("Panic: {e}") };
+                                            let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                                        }
                                     }
-                                    Ok(Err(e)) => {
-                                        error!("Render failed: {e}");
-                                        let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: e };
-                                        let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
-                                    }
-                                    Err(e) => {
-                                        let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: format!("Panic: {e}") };
-                                        let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
-                                    }
-                                }
+                                });
                             }
                             None => {
                                 let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: Some(request_id), message: format!("No instance: {plugin_id}") };
-                                let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                                let mut w = write.lock().await;
+                                let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
                             }
                         }
                     }
@@ -399,11 +412,13 @@ async fn handle_connection(
                                     unsafe { auv3_show_gui_async(handle.ptr); }
                                 }
                                 let msg = GuiOpenedMsg { msg_type: "gui_opened", plugin_id };
-                                let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                                let mut w = write.lock().await;
+                                let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
                             }
                             None => {
                                 let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: None, message: format!("No instance: {plugin_id}") };
-                                let _ = write.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                                let mut w = write.lock().await;
+                                let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
                             }
                         }
                     }
@@ -437,7 +452,8 @@ async fn handle_connection(
                         }).collect();
 
                         let msg = ListMsg { msg_type: "plugin_list", plugins };
-                        let _ = write.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                        let mut w = write.lock().await;
+                        let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
                     }
                 }
             }
