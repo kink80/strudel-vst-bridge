@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 
 const SAMPLE_RATE: f64 = 48000.0;
-const BLOCK_SIZE: u32 = 512;
+const BLOCK_SIZE: u32 = 2048;
 
 // ─── FFI to auv3_host.m ────────────────────────────────────────────────────
 
@@ -205,8 +205,9 @@ fn render_note(
     let release_samples = (2.0 * SAMPLE_RATE as f32) as usize;
     let max_samples = total_samples + release_samples;
 
-    let mut left_out = Vec::with_capacity(max_samples);
-    let mut right_out = Vec::with_capacity(max_samples);
+    // Single allocation upfront — render directly into these buffers
+    let mut left_out = vec![0.0f32; max_samples];
+    let mut right_out = vec![0.0f32; max_samples];
 
     let vel_midi = (velocity.clamp(0.0, 1.0) * 127.0) as u8;
 
@@ -217,57 +218,68 @@ fn render_note(
 
     let mut rendered = 0;
     let bs = BLOCK_SIZE as usize;
-    let mut lo = vec![0.0f32; bs];
-    let mut ro = vec![0.0f32; bs];
 
+    // Note-on phase: render directly into output slices
     while rendered < total_samples {
         let frames = bs.min(total_samples - rendered);
-        lo.iter_mut().for_each(|s| *s = 0.0);
-        ro.iter_mut().for_each(|s| *s = 0.0);
-
-        let rc = unsafe { auv3_render(handle.ptr, frames as u32, lo.as_mut_ptr(), ro.as_mut_ptr()) };
+        let rc = unsafe {
+            auv3_render(
+                handle.ptr,
+                frames as u32,
+                left_out[rendered..].as_mut_ptr(),
+                right_out[rendered..].as_mut_ptr(),
+            )
+        };
         if rc != 0 {
             return Err(format!("Render failed: {rc}"));
         }
-
-        left_out.extend_from_slice(&lo[..frames]);
-        right_out.extend_from_slice(&ro[..frames]);
         rendered += frames;
     }
 
     unsafe { auv3_note_off(handle.ptr, note, 64, 0); }
 
+    // Release tail: render until silence
     let silence_threshold = 1e-6_f32;
     let mut silent_blocks = 0;
 
     while rendered < max_samples && silent_blocks < 10 {
         let frames = bs.min(max_samples - rendered);
-        lo.iter_mut().for_each(|s| *s = 0.0);
-        ro.iter_mut().for_each(|s| *s = 0.0);
-
-        let rc = unsafe { auv3_render(handle.ptr, frames as u32, lo.as_mut_ptr(), ro.as_mut_ptr()) };
+        let rc = unsafe {
+            auv3_render(
+                handle.ptr,
+                frames as u32,
+                left_out[rendered..].as_mut_ptr(),
+                right_out[rendered..].as_mut_ptr(),
+            )
+        };
         if rc != 0 { break; }
 
-        let rms: f32 = lo[..frames].iter().chain(ro[..frames].iter())
+        let rms: f32 = left_out[rendered..rendered + frames].iter()
+            .chain(right_out[rendered..rendered + frames].iter())
             .map(|s| s * s).sum::<f32>() / (frames * 2) as f32;
 
         if rms < silence_threshold { silent_blocks += 1; } else { silent_blocks = 0; }
-
-        left_out.extend_from_slice(&lo[..frames]);
-        right_out.extend_from_slice(&ro[..frames]);
         rendered += frames;
     }
+
+    // Truncate to actual rendered length
+    left_out.truncate(rendered);
+    right_out.truncate(rendered);
 
     Ok((left_out, right_out))
 }
 
 fn encode_audio_response(request_id: u32, left: &[f32], right: &[f32]) -> Vec<u8> {
     let num_samples = left.len() as u32;
-    let mut buf = Vec::with_capacity(8 + (left.len() + right.len()) * 4);
-    buf.extend_from_slice(&request_id.to_le_bytes());
-    buf.extend_from_slice(&num_samples.to_le_bytes());
-    for s in left { buf.extend_from_slice(&s.to_le_bytes()); }
-    for s in right { buf.extend_from_slice(&s.to_le_bytes()); }
+    let total_bytes = 8 + (left.len() + right.len()) * 4;
+    let mut buf = vec![0u8; total_bytes];
+    buf[0..4].copy_from_slice(&request_id.to_le_bytes());
+    buf[4..8].copy_from_slice(&num_samples.to_le_bytes());
+    // Bulk copy float slices as bytes (safe on LE architectures: x86, ARM)
+    let left_bytes = unsafe { std::slice::from_raw_parts(left.as_ptr() as *const u8, left.len() * 4) };
+    let right_bytes = unsafe { std::slice::from_raw_parts(right.as_ptr() as *const u8, right.len() * 4) };
+    buf[8..8 + left.len() * 4].copy_from_slice(left_bytes);
+    buf[8 + left.len() * 4..].copy_from_slice(right_bytes);
     buf
 }
 

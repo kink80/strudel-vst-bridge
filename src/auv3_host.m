@@ -114,15 +114,13 @@ AUv3Plugin* auv3_load_plugin(const char* componentName, double sampleRate, uint3
         // Get the render block
         AURenderBlock renderBlock = auAudioUnit.renderBlock;
 
-        // Create output buffer list
+        // Create output buffer list (data pointers set per-render call)
         AudioBufferList* abl = (AudioBufferList*)calloc(1, sizeof(AudioBufferList) + sizeof(AudioBuffer));
         abl->mNumberBuffers = 2;
         abl->mBuffers[0].mNumberChannels = 1;
-        abl->mBuffers[0].mDataByteSize = maxFrames * sizeof(float);
-        abl->mBuffers[0].mData = calloc(maxFrames, sizeof(float));
+        abl->mBuffers[0].mData = NULL;
         abl->mBuffers[1].mNumberChannels = 1;
-        abl->mBuffers[1].mDataByteSize = maxFrames * sizeof(float);
-        abl->mBuffers[1].mData = calloc(maxFrames, sizeof(float));
+        abl->mBuffers[1].mData = NULL;
 
         AUv3Plugin* plugin = (AUv3Plugin*)calloc(1, sizeof(AUv3Plugin));
         plugin->auAudioUnit = (__bridge_retained void*)auAudioUnit;
@@ -173,8 +171,6 @@ void auv3_destroy_plugin(AUv3Plugin* plugin) {
     }
 
     if (plugin->outputBufferList) {
-        free(plugin->outputBufferList->mBuffers[0].mData);
-        free(plugin->outputBufferList->mBuffers[1].mData);
         free(plugin->outputBufferList);
     }
     free(plugin);
@@ -211,11 +207,11 @@ int auv3_render(AUv3Plugin* plugin, uint32_t numFrames, float* outLeft, float* o
 
     AURenderBlock renderBlock = (__bridge AURenderBlock)(plugin->renderBlock);
 
-    // Point output buffers at our pre-allocated memory
+    // Point output buffer list directly at caller's buffers — zero-copy
     plugin->outputBufferList->mBuffers[0].mDataByteSize = numFrames * sizeof(float);
+    plugin->outputBufferList->mBuffers[0].mData = outLeft;
     plugin->outputBufferList->mBuffers[1].mDataByteSize = numFrames * sizeof(float);
-    memset(plugin->outputBufferList->mBuffers[0].mData, 0, numFrames * sizeof(float));
-    memset(plugin->outputBufferList->mBuffers[1].mData, 0, numFrames * sizeof(float));
+    plugin->outputBufferList->mBuffers[1].mData = outRight;
 
     AudioUnitRenderActionFlags flags = 0;
     AudioTimeStamp timestamp = {0};
@@ -228,11 +224,6 @@ int auv3_render(AUv3Plugin* plugin, uint32_t numFrames, float* outLeft, float* o
     }
 
     plugin->sampleTime += numFrames;
-
-    // Copy to output
-    memcpy(outLeft, plugin->outputBufferList->mBuffers[0].mData, numFrames * sizeof(float));
-    memcpy(outRight, plugin->outputBufferList->mBuffers[1].mData, numFrames * sizeof(float));
-
     return 0;
 }
 
