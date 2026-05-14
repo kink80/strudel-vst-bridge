@@ -5,13 +5,11 @@ use std::ffi::{CStr, CString};
 use std::net::SocketAddr;
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
-
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 const SAMPLE_RATE: f64 = 48000.0;
@@ -23,6 +21,20 @@ const BLOCK_SIZE: u32 = 2048;
 pub struct AUv3Plugin {
     _opaque: [u8; 0],
 }
+
+#[repr(C)]
+#[derive(Clone)]
+struct AudioDeviceInfoC {
+    device_id: u32,
+    name: [u8; 256],
+    uid: [u8; 256],
+    is_input: i32,
+    is_output: i32,
+    input_channels: u32,
+    output_channels: u32,
+}
+
+type DeviceChangedCallback = extern "C" fn(ctx: *mut std::ffi::c_void);
 
 extern "C" {
     fn auv3_load_plugin(name: *const c_char, sample_rate: f64, max_frames: u32) -> *mut AUv3Plugin;
@@ -38,6 +50,22 @@ extern "C" {
     fn auv3_run_main_loop();
     fn auv3_show_gui_async(plugin: *mut AUv3Plugin);
     fn auv3_list_plugins(out: *mut AUv3PluginInfoC, max_out: u32) -> u32;
+
+    // Audio device enumeration
+    fn auv3_list_audio_devices(out: *mut AudioDeviceInfoC, max_out: u32) -> u32;
+    fn auv3_get_default_input_device() -> u32;
+    fn auv3_get_default_output_device() -> u32;
+
+    // Audio router
+    fn auv3_router_set_input(device_id: u32) -> i32;
+    fn auv3_router_set_output(device_id: u32) -> i32;
+    fn auv3_router_set_chain(plugins: *const *mut AUv3Plugin, count: i32) -> i32;
+    fn auv3_router_start() -> i32;
+    fn auv3_router_stop() -> i32;
+    fn auv3_router_is_running() -> i32;
+
+    // Device hotplug
+    fn auv3_register_device_change_callback(cb: DeviceChangedCallback, ctx: *mut std::ffi::c_void);
 }
 
 #[repr(C)]
@@ -104,6 +132,30 @@ enum IncomingMessage {
     },
     #[serde(rename = "list_plugins")]
     ListPlugins,
+
+    // ─── Audio routing messages ────────────────────────────────────────
+    #[serde(rename = "list_audio_devices")]
+    ListAudioDevices,
+    #[serde(rename = "set_audio_input")]
+    SetAudioInput {
+        #[serde(rename = "deviceId")]
+        device_id: u32,
+    },
+    #[serde(rename = "set_audio_output")]
+    SetAudioOutput {
+        #[serde(rename = "deviceId")]
+        device_id: u32,
+    },
+    #[serde(rename = "set_effect_chain")]
+    SetEffectChain {
+        chain: Vec<String>, // labels of plugin instances
+    },
+    #[serde(rename = "start_audio")]
+    StartAudio,
+    #[serde(rename = "stop_audio")]
+    StopAudio,
+    #[serde(rename = "get_audio_status")]
+    GetAudioStatus,
 }
 
 fn default_velocity() -> f32 { 0.8 }
@@ -289,6 +341,7 @@ async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
     manager: Arc<Mutex<PluginManager>>,
+    mut device_changed_rx: broadcast::Receiver<()>,
 ) {
     info!("New connection from {addr}");
 
@@ -300,6 +353,15 @@ async fn handle_connection(
     let (write, mut read) = ws_stream.split();
     // Wrap writer in Arc<Mutex> so render tasks can send responses concurrently
     let write = Arc::new(Mutex::new(write));
+
+    // Forward device change notifications to this WebSocket client
+    let write_for_notify = write.clone();
+    tokio::spawn(async move {
+        while device_changed_rx.recv().await.is_ok() {
+            let mut w = write_for_notify.lock().await;
+            let _ = w.send(Message::Text(r#"{"type":"device_list_changed"}"#.to_string())).await;
+        }
+    });
 
     while let Some(msg) = read.next().await {
         let msg = match msg {
@@ -467,11 +529,182 @@ async fn handle_connection(
                         let mut w = write.lock().await;
                         let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
                     }
+
+                    // ─── Audio routing handlers ────────────────────────────
+                    IncomingMessage::ListAudioDevices => {
+                        let mut infos = vec![AudioDeviceInfoC {
+                            device_id: 0,
+                            name: [0u8; 256],
+                            uid: [0u8; 256],
+                            is_input: 0,
+                            is_output: 0,
+                            input_channels: 0,
+                            output_channels: 0,
+                        }; 64];
+                        let count = unsafe { auv3_list_audio_devices(infos.as_mut_ptr(), 64) } as usize;
+                        let default_input = unsafe { auv3_get_default_input_device() };
+                        let default_output = unsafe { auv3_get_default_output_device() };
+
+                        #[derive(Serialize)]
+                        struct DeviceListMsg {
+                            #[serde(rename = "type")]
+                            msg_type: &'static str,
+                            devices: Vec<DeviceEntry>,
+                            #[serde(rename = "defaultInput")]
+                            default_input: u32,
+                            #[serde(rename = "defaultOutput")]
+                            default_output: u32,
+                        }
+                        #[derive(Serialize)]
+                        struct DeviceEntry {
+                            #[serde(rename = "deviceId")]
+                            device_id: u32,
+                            name: String,
+                            uid: String,
+                            #[serde(rename = "isInput")]
+                            is_input: bool,
+                            #[serde(rename = "isOutput")]
+                            is_output: bool,
+                            #[serde(rename = "inputChannels")]
+                            input_channels: u32,
+                            #[serde(rename = "outputChannels")]
+                            output_channels: u32,
+                        }
+
+                        let devices: Vec<DeviceEntry> = infos[..count].iter().map(|d| DeviceEntry {
+                            device_id: d.device_id,
+                            name: c_str(&d.name),
+                            uid: c_str(&d.uid),
+                            is_input: d.is_input != 0,
+                            is_output: d.is_output != 0,
+                            input_channels: d.input_channels,
+                            output_channels: d.output_channels,
+                        }).collect();
+
+                        let msg = DeviceListMsg {
+                            msg_type: "audio_device_list",
+                            devices,
+                            default_input,
+                            default_output,
+                        };
+                        let mut w = write.lock().await;
+                        let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                    }
+
+                    IncomingMessage::SetAudioInput { device_id } => {
+                        let rc = unsafe { auv3_router_set_input(device_id) };
+                        #[derive(Serialize)]
+                        struct Msg { #[serde(rename = "type")] msg_type: &'static str, #[serde(rename = "deviceId")] device_id: u32, success: bool }
+                        let msg = Msg { msg_type: "audio_input_set", device_id, success: rc == 0 };
+                        let mut w = write.lock().await;
+                        let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                    }
+
+                    IncomingMessage::SetAudioOutput { device_id } => {
+                        let rc = unsafe { auv3_router_set_output(device_id) };
+                        #[derive(Serialize)]
+                        struct Msg { #[serde(rename = "type")] msg_type: &'static str, #[serde(rename = "deviceId")] device_id: u32, success: bool }
+                        let msg = Msg { msg_type: "audio_output_set", device_id, success: rc == 0 };
+                        let mut w = write.lock().await;
+                        let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                    }
+
+                    IncomingMessage::SetEffectChain { chain } => {
+                        // Resolve labels to plugin pointers and call FFI before any await
+                        let resolve_result = {
+                            let mgr = manager.lock().await;
+                            let mut ptrs: Vec<*mut AUv3Plugin> = Vec::new();
+                            let mut missing: Vec<String> = Vec::new();
+
+                            for label in &chain {
+                                match mgr.get_instance(label) {
+                                    Some(handle_arc) => {
+                                        let handle = handle_arc.lock().unwrap();
+                                        ptrs.push(handle.ptr);
+                                    }
+                                    None => {
+                                        missing.push(label.clone());
+                                    }
+                                }
+                            }
+
+                            if missing.is_empty() {
+                                unsafe { auv3_router_set_chain(ptrs.as_ptr(), ptrs.len() as i32) };
+                                Ok(())
+                            } else {
+                                Err(missing)
+                            }
+                        };
+
+                        match resolve_result {
+                            Ok(()) => {
+                                #[derive(Serialize)]
+                                struct Msg { #[serde(rename = "type")] msg_type: &'static str, chain: Vec<String> }
+                                let msg = Msg { msg_type: "effect_chain_set", chain };
+                                let mut w = write.lock().await;
+                                let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                            }
+                            Err(missing) => {
+                                let err = ErrorMsg {
+                                    msg_type: "error",
+                                    plugin_id: None,
+                                    request_id: None,
+                                    message: format!("Unknown instances: {}", missing.join(", ")),
+                                };
+                                let mut w = write.lock().await;
+                                let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                            }
+                        }
+                    }
+
+                    IncomingMessage::StartAudio => {
+                        let rc = unsafe { auv3_router_start() };
+                        #[derive(Serialize)]
+                        struct Msg { #[serde(rename = "type")] msg_type: &'static str, running: bool, message: String }
+                        let msg = if rc == 0 {
+                            Msg { msg_type: "audio_status", running: true, message: "Audio started".into() }
+                        } else {
+                            Msg { msg_type: "audio_status", running: false, message: format!("Failed to start audio: {rc}") }
+                        };
+                        let mut w = write.lock().await;
+                        let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                    }
+
+                    IncomingMessage::StopAudio => {
+                        let rc = unsafe { auv3_router_stop() };
+                        #[derive(Serialize)]
+                        struct Msg { #[serde(rename = "type")] msg_type: &'static str, running: bool, message: String }
+                        let msg = Msg { msg_type: "audio_status", running: rc != 0, message: "Audio stopped".into() };
+                        let mut w = write.lock().await;
+                        let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                    }
+
+                    IncomingMessage::GetAudioStatus => {
+                        let running = unsafe { auv3_router_is_running() } != 0;
+                        #[derive(Serialize)]
+                        struct Msg { #[serde(rename = "type")] msg_type: &'static str, running: bool }
+                        let msg = Msg { msg_type: "audio_status", running };
+                        let mut w = write.lock().await;
+                        let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                    }
                 }
             }
             Message::Close(_) => { info!("Connection closed: {addr}"); break; }
             _ => {}
         }
+    }
+}
+
+// ─── Main ───────────────────────────────────────────────────────────────────
+
+// ─── Device change callback (called from CoreAudio thread) ─────────────────
+
+// Global broadcast sender — initialized once in main, read from the C callback.
+static DEVICE_CHANGED_TX: std::sync::OnceLock<broadcast::Sender<()>> = std::sync::OnceLock::new();
+
+extern "C" fn device_changed_callback(_ctx: *mut std::ffi::c_void) {
+    if let Some(tx) = DEVICE_CHANGED_TX.get() {
+        let _ = tx.send(());
     }
 }
 
@@ -484,6 +717,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let manager = Arc::new(Mutex::new(PluginManager::new()));
 
+    // Create broadcast channel for device change notifications
+    let (device_tx, _) = broadcast::channel::<()>(16);
+    let _ = DEVICE_CHANGED_TX.set(device_tx.clone());
+
+    // Register device hotplug listener
+    unsafe {
+        auv3_register_device_change_callback(
+            device_changed_callback,
+            std::ptr::null_mut(),
+        );
+    }
+
     let manager_clone = manager.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -495,7 +740,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let (stream, addr) = listener.accept().await.unwrap();
                 let manager = manager_clone.clone();
-                tokio::spawn(handle_connection(stream, addr, manager));
+                let device_rx = device_tx.subscribe();
+                tokio::spawn(handle_connection(stream, addr, manager, device_rx));
             }
         });
     });
