@@ -13,7 +13,6 @@ fn main() {
 
     // Link required frameworks
     println!("cargo:rustc-link-lib=framework=AudioToolbox");
-    println!("cargo:rustc-link-lib=framework=CoreAudio");
     println!("cargo:rustc-link-lib=framework=CoreAudioKit");
     println!("cargo:rustc-link-lib=framework=AppKit");
     println!("cargo:rustc-link-lib=framework=AVFoundation");
