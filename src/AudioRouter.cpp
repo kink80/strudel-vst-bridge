@@ -66,6 +66,18 @@ bool AudioRouter::setOutputDevice (const std::string& name)
 
 void AudioRouter::setEffectChain (const std::vector<std::string>& labels)
 {
+    // prepareToPlay must happen on the message thread for VST3 plugins
+    if (! juce::MessageManager::getInstance()->isThisTheMessageThread())
+    {
+        juce::WaitableEvent done;
+        juce::MessageManager::callAsync ([&]() {
+            setEffectChain (labels);
+            done.signal();
+        });
+        done.wait();
+        return;
+    }
+
     auto* newChain = new ChainState();
     newChain->labels = labels;
     for (auto& label : labels)
@@ -133,13 +145,37 @@ void AudioRouter::audioDeviceIOCallbackWithContext (
     auto* chain = activeChain.load (std::memory_order_acquire);
     if (chain && ! chain->processors.empty())
     {
-        juce::AudioBuffer<float> buffer (outputChannelData, numOutputChannels, numSamples);
-        juce::MidiBuffer midi;
-
         for (auto* proc : chain->processors)
         {
-            if (proc)
+            if (! proc) continue;
+
+            // Create buffer with enough channels for the plugin
+            int pluginChannels = std::max (proc->getTotalNumInputChannels(),
+                                           proc->getTotalNumOutputChannels());
+            int bufChannels = std::max (numOutputChannels, pluginChannels);
+
+            if (bufChannels <= numOutputChannels)
+            {
+                // Plugin fits in output buffer — process in-place
+                juce::AudioBuffer<float> buffer (outputChannelData, numOutputChannels, numSamples);
+                juce::MidiBuffer midi;
                 proc->processBlock (buffer, midi);
+            }
+            else
+            {
+                // Plugin needs more channels — use temporary buffer
+                juce::AudioBuffer<float> buffer (bufChannels, numSamples);
+                buffer.clear();
+                for (int ch = 0; ch < numOutputChannels; ch++)
+                    buffer.copyFrom (ch, 0, outputChannelData[ch], numSamples);
+
+                juce::MidiBuffer midi;
+                proc->processBlock (buffer, midi);
+
+                for (int ch = 0; ch < numOutputChannels; ch++)
+                    memcpy (outputChannelData[ch], buffer.getReadPointer (ch),
+                            (size_t)numSamples * sizeof (float));
+            }
         }
     }
 }

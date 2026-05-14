@@ -57,6 +57,20 @@ juce::PluginDescription PluginHost::findPlugin (const std::string& name) const
 
 std::string PluginHost::createInstance (const std::string& label, const std::string& pluginName)
 {
+    // VST3 requires instantiation + prepareToPlay on the message thread.
+    // If we're not on it, block until the message thread does the work.
+    if (! juce::MessageManager::getInstance()->isThisTheMessageThread())
+    {
+        std::string result;
+        juce::WaitableEvent done;
+        juce::MessageManager::callAsync ([&]() {
+            result = createInstance (label, pluginName);
+            done.signal();
+        });
+        done.wait();
+        return result;
+    }
+
     juce::ScopedLock sl (lock);
     if (instances.count (label))
         return "Instance '" + label + "' already exists";
@@ -82,6 +96,17 @@ std::string PluginHost::createInstance (const std::string& label, const std::str
 
 void PluginHost::deleteInstance (const std::string& label)
 {
+    if (! juce::MessageManager::getInstance()->isThisTheMessageThread())
+    {
+        juce::WaitableEvent done;
+        juce::MessageManager::callAsync ([&]() {
+            deleteInstance (label);
+            done.signal();
+        });
+        done.wait();
+        return;
+    }
+
     juce::ScopedLock sl (lock);
     auto it = instances.find (label);
     if (it != instances.end())
@@ -123,6 +148,10 @@ PluginHost::RenderResult PluginHost::renderNote (
         proc = it->second.processor.get();
     }
 
+    // Use the plugin's actual channel count (must be >= 2 for stereo output)
+    int numChannels = std::max (2, std::max (proc->getTotalNumInputChannels(),
+                                              proc->getTotalNumOutputChannels()));
+
     auto totalSamples = (int)(duration * sampleRate);
     auto releaseSamples = (int)(2.0 * sampleRate);
     auto maxSamples = totalSamples + releaseSamples;
@@ -137,7 +166,7 @@ PluginHost::RenderResult PluginHost::renderNote (
     while (rendered < totalSamples)
     {
         int frames = std::min (blockSize, totalSamples - rendered);
-        juce::AudioBuffer<float> buffer (2, frames);
+        juce::AudioBuffer<float> buffer (numChannels, frames);
         buffer.clear();
 
         juce::MidiBuffer blockMidi;
@@ -146,7 +175,10 @@ PluginHost::RenderResult PluginHost::renderNote (
         proc->processBlock (buffer, blockMidi);
 
         memcpy (result.left.data() + rendered, buffer.getReadPointer (0), frames * sizeof (float));
-        memcpy (result.right.data() + rendered, buffer.getReadPointer (1), frames * sizeof (float));
+        if (numChannels >= 2)
+            memcpy (result.right.data() + rendered, buffer.getReadPointer (1), frames * sizeof (float));
+        else
+            memcpy (result.right.data() + rendered, buffer.getReadPointer (0), frames * sizeof (float));
         rendered += frames;
     }
 
@@ -160,7 +192,7 @@ PluginHost::RenderResult PluginHost::renderNote (
         while (rendered < maxSamples && silentBlocks < 10)
         {
             int frames = std::min (blockSize, maxSamples - rendered);
-            juce::AudioBuffer<float> buffer (2, frames);
+            juce::AudioBuffer<float> buffer (numChannels, frames);
             buffer.clear();
 
             juce::MidiBuffer& midi = (rendered == totalSamples) ? offMidi : emptyMidi;
@@ -170,12 +202,16 @@ PluginHost::RenderResult PluginHost::renderNote (
             for (int i = 0; i < frames; i++)
             {
                 rms += buffer.getSample (0, i) * buffer.getSample (0, i);
-                rms += buffer.getSample (1, i) * buffer.getSample (1, i);
+                if (numChannels >= 2)
+                    rms += buffer.getSample (1, i) * buffer.getSample (1, i);
             }
-            rms /= (frames * 2);
+            rms /= (frames * std::min (numChannels, 2));
 
             memcpy (result.left.data() + rendered, buffer.getReadPointer (0), frames * sizeof (float));
-            memcpy (result.right.data() + rendered, buffer.getReadPointer (1), frames * sizeof (float));
+            if (numChannels >= 2)
+                memcpy (result.right.data() + rendered, buffer.getReadPointer (1), frames * sizeof (float));
+            else
+                memcpy (result.right.data() + rendered, buffer.getReadPointer (0), frames * sizeof (float));
             rendered += frames;
 
             if (rms < 1e-6f) silentBlocks++;
