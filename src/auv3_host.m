@@ -3,8 +3,10 @@
 // the same instance handles both audio rendering and GUI display.
 
 #import <AudioToolbox/AudioToolbox.h>
+#import <AVFoundation/AVFoundation.h>
 #import <CoreAudioKit/CoreAudioKit.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <CoreMIDI/CoreMIDI.h>
 #import <AppKit/AppKit.h>
 #include <stdint.h>
 #include <string.h>
@@ -12,17 +14,45 @@
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 typedef struct {
-    void* auAudioUnit;       // AUAudioUnit* (retained)
-    void* renderBlock;       // AURenderBlock (retained)
-    AudioBufferList* outputBufferList;
+    void* auAudioUnit;       // AUAudioUnit* (retained) — for params, state, MIDI scheduling
+    void* avAudioUnit;       // AVAudioUnit* (retained) — engine-attachable node
+    MIDIEndpointRef midiEndpoint;  // virtual MIDI destination (0 if none)
     uint32_t maxFrames;
     double sampleRate;
-    int64_t sampleTime;      // Running sample counter for timestamps
     void* guiWindow;         // NSWindow* (retained)
     void* guiViewController; // NSViewController* (retained)
     char name[256];
     char manufacturer[256];
+    char label[128];         // user-facing instance label (for MIDI port name)
 } AUv3Plugin;
+
+// ─── Shared engine + CoreMIDI client ────────────────────────────────────────
+static AVAudioEngine* g_engine = nil;
+static MIDIClientRef  g_midiClient = 0;
+
+static void ensureEngine(double sampleRate) {
+    (void)sampleRate; // engine derives format from the default output device
+    if (g_engine) return;
+    g_engine = [[AVAudioEngine alloc] init];
+    NSLog(@"[auv3] AVAudioEngine created");
+}
+
+static void ensureMIDIClient(void) {
+    if (g_midiClient) return;
+    OSStatus s = MIDIClientCreate((__bridge CFStringRef)@"strudel-vst-bridge", NULL, NULL, &g_midiClient);
+    if (s != noErr) {
+        NSLog(@"[auv3] MIDIClientCreate failed: %d", (int)s);
+        g_midiClient = 0;
+        return;
+    }
+    NSLog(@"[auv3] CoreMIDI client created");
+}
+
+// Forward declarations — definitions below.
+int  auv3_engine_attach(AUv3Plugin* plugin);
+void auv3_engine_detach(AUv3Plugin* plugin);
+int  auv3_create_midi_source(AUv3Plugin* plugin, const char* label);
+void auv3_destroy_midi_source(AUv3Plugin* plugin);
 
 // ─── Plugin lifecycle ───────────────────────────────────────────────────────
 
@@ -69,67 +99,28 @@ AUv3Plugin* auv3_load_plugin(const char* componentName, double sampleRate, uint3
     // its MessageManager during instantiation, which must happen on the main thread
     // for popup menus and modal dialogs to work correctly.
     dispatch_async(dispatch_get_main_queue(), ^{
-    [AUAudioUnit instantiateWithComponentDescription:desc
-                                              options:kAudioComponentInstantiation_LoadInProcess
-                                    completionHandler:^(AUAudioUnit* _Nullable auAudioUnit, NSError* _Nullable error) {
-        if (error || !auAudioUnit) {
+    [AVAudioUnit instantiateWithComponentDescription:desc
+                                             options:kAudioComponentInstantiation_LoadInProcess
+                                   completionHandler:^(AVAudioUnit* _Nullable avAudioUnit, NSError* _Nullable error) {
+        if (error || !avAudioUnit) {
             NSLog(@"[auv3] Failed to instantiate: %@", error);
             dispatch_semaphore_signal(sem);
             return;
         }
 
-        NSError* allocError = nil;
-
-        // Configure format: stereo float, non-interleaved
-        AVAudioFormat* format = [[AVAudioFormat alloc]
-            initStandardFormatWithSampleRate:sampleRate
-                                   channels:2];
-
-        // Set output format
-        [auAudioUnit.outputBusses[0] setFormat:format error:&allocError];
-        if (allocError) {
-            NSLog(@"[auv3] Failed to set output format: %@", allocError);
-        }
-
-        // Set input format if the plugin has inputs
-        if (auAudioUnit.inputBusses.count > 0) {
-            allocError = nil;
-            [auAudioUnit.inputBusses[0] setFormat:format error:&allocError];
-            if (allocError) {
-                NSLog(@"[auv3] Failed to set input format: %@", allocError);
-            }
-        }
-
+        AUAudioUnit* auAudioUnit = avAudioUnit.AUAudioUnit;
         auAudioUnit.maximumFramesToRender = maxFrames;
-
-        // Allocate render resources
-        allocError = nil;
-        [auAudioUnit allocateRenderResourcesAndReturnError:&allocError];
-        if (allocError) {
-            NSLog(@"[auv3] Failed to allocate render resources: %@", allocError);
-            dispatch_semaphore_signal(sem);
-            return;
-        }
-
-        // Get the render block
-        AURenderBlock renderBlock = auAudioUnit.renderBlock;
-
-        // Create output buffer list (data pointers set per-render call)
-        AudioBufferList* abl = (AudioBufferList*)calloc(1, sizeof(AudioBufferList) + sizeof(AudioBuffer));
-        abl->mNumberBuffers = 2;
-        abl->mBuffers[0].mNumberChannels = 1;
-        abl->mBuffers[0].mData = NULL;
-        abl->mBuffers[1].mNumberChannels = 1;
-        abl->mBuffers[1].mData = NULL;
+        // Engine handles allocateRenderResources at attach/start time.
 
         AUv3Plugin* plugin = (AUv3Plugin*)calloc(1, sizeof(AUv3Plugin));
         plugin->auAudioUnit = (__bridge_retained void*)auAudioUnit;
-        plugin->renderBlock = (__bridge_retained void*)[renderBlock copy];
-        plugin->outputBufferList = abl;
+        plugin->avAudioUnit = (__bridge_retained void*)avAudioUnit;
+        plugin->midiEndpoint = 0;
         plugin->maxFrames = maxFrames;
         plugin->sampleRate = sampleRate;
         plugin->guiWindow = NULL;
         plugin->guiViewController = NULL;
+        plugin->label[0] = '\0';
 
         // Copy name
         NSString* fullName = auAudioUnit.audioUnitName ?: @"Unknown";
@@ -153,6 +144,10 @@ AUv3Plugin* auv3_load_plugin(const char* componentName, double sampleRate, uint3
 void auv3_destroy_plugin(AUv3Plugin* plugin) {
     if (!plugin) return;
 
+    // Detach + tear down MIDI first so no events can land on a dying node.
+    auv3_engine_detach(plugin);
+    auv3_destroy_midi_source(plugin);
+
     if (plugin->guiWindow) {
         NSWindow* win = (__bridge_transfer NSWindow*)plugin->guiWindow;
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -163,17 +158,93 @@ void auv3_destroy_plugin(AUv3Plugin* plugin) {
         NSViewController* vc __attribute__((unused)) = (__bridge_transfer NSViewController*)plugin->guiViewController;
     }
 
-    AUAudioUnit* au = (__bridge_transfer AUAudioUnit*)plugin->auAudioUnit;
-    [au deallocateRenderResources];
+    AUAudioUnit* au __attribute__((unused)) = (__bridge_transfer AUAudioUnit*)plugin->auAudioUnit;
+    AVAudioUnit* avau __attribute__((unused)) = (__bridge_transfer AVAudioUnit*)plugin->avAudioUnit;
 
-    if (plugin->renderBlock) {
-        AURenderBlock block __attribute__((unused)) = (__bridge_transfer AURenderBlock)plugin->renderBlock;
-    }
-
-    if (plugin->outputBufferList) {
-        free(plugin->outputBufferList);
-    }
     free(plugin);
+}
+
+// ─── Engine attach / detach ─────────────────────────────────────────────────
+
+int auv3_engine_attach(AUv3Plugin* plugin) {
+    if (!plugin || !plugin->avAudioUnit) return -1;
+    ensureEngine(plugin->sampleRate);
+
+    AVAudioUnit* avau = (__bridge AVAudioUnit*)plugin->avAudioUnit;
+    AVAudioFormat* fmt = [g_engine.mainMixerNode outputFormatForBus:0];
+
+    [g_engine attachNode:avau];
+    [g_engine connect:avau to:g_engine.mainMixerNode format:fmt];
+
+    if (!g_engine.isRunning) {
+        NSError* err = nil;
+        if (![g_engine startAndReturnError:&err]) {
+            NSLog(@"[auv3] engine start failed: %@", err);
+            return -2;
+        }
+        NSLog(@"[auv3] engine started, sr=%.0f", fmt.sampleRate);
+    }
+    NSLog(@"[auv3] attached '%s' to engine", plugin->name);
+    return 0;
+}
+
+void auv3_engine_detach(AUv3Plugin* plugin) {
+    if (!plugin || !plugin->avAudioUnit || !g_engine) return;
+    AVAudioUnit* avau = (__bridge AVAudioUnit*)plugin->avAudioUnit;
+    @try {
+        [g_engine disconnectNodeOutput:avau];
+        [g_engine detachNode:avau];
+    } @catch (NSException* ex) {
+        NSLog(@"[auv3] detach threw: %@", ex);
+    }
+}
+
+// ─── Per-instance virtual MIDI destination ──────────────────────────────────
+
+// MIDI read callback. Runs on a high-priority CoreMIDI thread.
+// Forwards bytes to the AU's scheduleMIDIEventBlock (realtime-safe).
+static void instanceMidiReadProc(const MIDIPacketList* pktList, void* refCon, void* srcConnRefCon) {
+    (void)srcConnRefCon;
+    AUv3Plugin* plugin = (AUv3Plugin*)refCon;
+    if (!plugin || !plugin->auAudioUnit) return;
+    AUAudioUnit* au = (__bridge AUAudioUnit*)plugin->auAudioUnit;
+    AUScheduleMIDIEventBlock midiBlock = au.scheduleMIDIEventBlock;
+    if (!midiBlock) return;
+
+    const MIDIPacket* pkt = &pktList->packet[0];
+    for (UInt32 i = 0; i < pktList->numPackets; i++) {
+        if (pkt->length > 0 && pkt->length <= 3) {
+            midiBlock(AUEventSampleTimeImmediate, 0, pkt->length, pkt->data);
+        }
+        pkt = MIDIPacketNext(pkt);
+    }
+}
+
+int auv3_create_midi_source(AUv3Plugin* plugin, const char* label) {
+    if (!plugin) return -1;
+    ensureMIDIClient();
+    if (!g_midiClient) return -2;
+
+    strncpy(plugin->label, label ?: "", sizeof(plugin->label) - 1);
+    plugin->label[sizeof(plugin->label) - 1] = '\0';
+
+    NSString* portName = [NSString stringWithFormat:@"strudel-vst:%s", plugin->label];
+    MIDIEndpointRef endpoint = 0;
+    OSStatus s = MIDIDestinationCreate(g_midiClient, (__bridge CFStringRef)portName,
+                                       instanceMidiReadProc, plugin, &endpoint);
+    if (s != noErr) {
+        NSLog(@"[auv3] MIDIDestinationCreate(%@) failed: %d", portName, (int)s);
+        return -3;
+    }
+    plugin->midiEndpoint = endpoint;
+    NSLog(@"[auv3] virtual MIDI destination: %@", portName);
+    return 0;
+}
+
+void auv3_destroy_midi_source(AUv3Plugin* plugin) {
+    if (!plugin || plugin->midiEndpoint == 0) return;
+    MIDIEndpointDispose(plugin->midiEndpoint);
+    plugin->midiEndpoint = 0;
 }
 
 // ─── MIDI ───────────────────────────────────────────────────────────────────
@@ -198,33 +269,6 @@ int auv3_note_on(AUv3Plugin* plugin, uint8_t note, uint8_t velocity, uint8_t cha
 int auv3_note_off(AUv3Plugin* plugin, uint8_t note, uint8_t velocity, uint8_t channel) {
     uint8_t data[3] = { (uint8_t)(0x80 | (channel & 0x0F)), note & 0x7F, velocity & 0x7F };
     return auv3_send_midi(plugin, data, 3);
-}
-
-// ─── Audio rendering ────────────────────────────────────────────────────────
-
-int auv3_render(AUv3Plugin* plugin, uint32_t numFrames, float* outLeft, float* outRight) {
-    if (!plugin || !plugin->renderBlock || numFrames > plugin->maxFrames) return -1;
-
-    AURenderBlock renderBlock = (__bridge AURenderBlock)(plugin->renderBlock);
-
-    // Point output buffer list directly at caller's buffers — zero-copy
-    plugin->outputBufferList->mBuffers[0].mDataByteSize = numFrames * sizeof(float);
-    plugin->outputBufferList->mBuffers[0].mData = outLeft;
-    plugin->outputBufferList->mBuffers[1].mDataByteSize = numFrames * sizeof(float);
-    plugin->outputBufferList->mBuffers[1].mData = outRight;
-
-    AudioUnitRenderActionFlags flags = 0;
-    AudioTimeStamp timestamp = {0};
-    timestamp.mSampleTime = (Float64)plugin->sampleTime;
-    timestamp.mFlags = kAudioTimeStampSampleTimeValid;
-
-    OSStatus status = renderBlock(&flags, &timestamp, numFrames, 0, plugin->outputBufferList, NULL);
-    if (status != noErr) {
-        return (int)status;
-    }
-
-    plugin->sampleTime += numFrames;
-    return 0;
 }
 
 // ─── GUI ────────────────────────────────────────────────────────────────────
@@ -319,6 +363,59 @@ float auv3_get_parameter(AUv3Plugin* plugin, uint32_t index) {
 
 const char* auv3_get_name(AUv3Plugin* plugin) {
     return plugin ? plugin->name : "";
+}
+
+// ─── State (preset) persistence ─────────────────────────────────────────────
+// Uses AUAudioUnit.fullState (NSDictionary) archived via NSKeyedArchiver.
+// Caller frees returned buffer with free(). Returns NULL on failure.
+
+uint8_t* auv3_get_state(AUv3Plugin* plugin, uint32_t* outLen) {
+    if (!plugin || !plugin->auAudioUnit || !outLen) return NULL;
+    AUAudioUnit* au = (__bridge AUAudioUnit*)(plugin->auAudioUnit);
+    NSDictionary* state = au.fullState;
+    if (!state) { *outLen = 0; return NULL; }
+
+    NSError* err = nil;
+    NSData* data = [NSKeyedArchiver archivedDataWithRootObject:state
+                                         requiringSecureCoding:NO
+                                                         error:&err];
+    if (err || !data) {
+        NSLog(@"[auv3] get_state archive failed: %@", err);
+        *outLen = 0;
+        return NULL;
+    }
+
+    uint8_t* buf = (uint8_t*)malloc(data.length);
+    if (!buf) { *outLen = 0; return NULL; }
+    memcpy(buf, data.bytes, data.length);
+    *outLen = (uint32_t)data.length;
+    return buf;
+}
+
+int auv3_set_state(AUv3Plugin* plugin, const uint8_t* bytes, uint32_t len) {
+    if (!plugin || !plugin->auAudioUnit || !bytes || len == 0) return -1;
+    AUAudioUnit* au = (__bridge AUAudioUnit*)(plugin->auAudioUnit);
+
+    NSData* data = [NSData dataWithBytes:bytes length:len];
+    NSError* err = nil;
+    NSSet* classes = [NSSet setWithArray:@[[NSDictionary class], [NSString class],
+                                            [NSNumber class], [NSData class],
+                                            [NSArray class]]];
+    NSDictionary* state = [NSKeyedUnarchiver unarchivedObjectOfClasses:classes
+                                                              fromData:data
+                                                                 error:&err];
+    if (err || !state) {
+        NSLog(@"[auv3] set_state unarchive failed: %@", err);
+        return -2;
+    }
+
+    @try {
+        au.fullState = state;
+    } @catch (NSException* ex) {
+        NSLog(@"[auv3] set_state assignment threw: %@", ex);
+        return -3;
+    }
+    return 0;
 }
 
 // ─── Plugin enumeration ─────────────────────────────────────────────────────

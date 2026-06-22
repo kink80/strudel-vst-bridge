@@ -5,10 +5,12 @@ use std::ffi::{CStr, CString};
 use std::net::SocketAddr;
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
 
+use std::path::PathBuf;
+
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -27,17 +29,16 @@ pub struct AUv3Plugin {
 extern "C" {
     fn auv3_load_plugin(name: *const c_char, sample_rate: f64, max_frames: u32) -> *mut AUv3Plugin;
     fn auv3_destroy_plugin(plugin: *mut AUv3Plugin);
-    fn auv3_note_on(plugin: *mut AUv3Plugin, note: u8, velocity: u8, channel: u8) -> i32;
-    fn auv3_note_off(plugin: *mut AUv3Plugin, note: u8, velocity: u8, channel: u8) -> i32;
-    fn auv3_render(plugin: *mut AUv3Plugin, num_frames: u32, out_left: *mut f32, out_right: *mut f32) -> i32;
+    fn auv3_engine_attach(plugin: *mut AUv3Plugin) -> i32;
+    fn auv3_create_midi_source(plugin: *mut AUv3Plugin, label: *const c_char) -> i32;
     fn auv3_show_gui(plugin: *mut AUv3Plugin);
-    fn auv3_parameter_count(plugin: *mut AUv3Plugin) -> u32;
-    fn auv3_set_parameter(plugin: *mut AUv3Plugin, index: u32, value: f32) -> i32;
-    fn auv3_get_parameter(plugin: *mut AUv3Plugin, index: u32) -> f32;
     fn auv3_get_name(plugin: *mut AUv3Plugin) -> *const c_char;
     fn auv3_run_main_loop();
     fn auv3_show_gui_async(plugin: *mut AUv3Plugin);
     fn auv3_list_plugins(out: *mut AUv3PluginInfoC, max_out: u32) -> u32;
+    fn auv3_get_state(plugin: *mut AUv3Plugin, out_len: *mut u32) -> *mut u8;
+    fn auv3_set_state(plugin: *mut AUv3Plugin, bytes: *const u8, len: u32) -> i32;
+    fn free(ptr: *mut u8);
 }
 
 #[repr(C)]
@@ -83,20 +84,6 @@ enum IncomingMessage {
     },
     #[serde(rename = "list_instances")]
     ListInstances,
-    #[serde(rename = "render")]
-    Render {
-        #[serde(rename = "requestId")]
-        request_id: u32,
-        #[serde(rename = "pluginId")]
-        plugin_id: String,
-        note: u8,
-        #[serde(default = "default_velocity")]
-        velocity: f32,
-        #[serde(default = "default_duration")]
-        duration: f32,
-        #[serde(default)]
-        params: HashMap<String, f32>,
-    },
     #[serde(rename = "show_gui")]
     ShowGui {
         #[serde(rename = "pluginId")]
@@ -104,10 +91,59 @@ enum IncomingMessage {
     },
     #[serde(rename = "list_plugins")]
     ListPlugins,
+    #[serde(rename = "get_state")]
+    GetState {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "pluginId")]
+        plugin_id: String,
+    },
+    #[serde(rename = "set_state")]
+    SetState {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "pluginId")]
+        plugin_id: String,
+        /// Base64-encoded NSKeyedArchiver blob.
+        state: String,
+    },
+    #[serde(rename = "save_preset")]
+    SavePreset {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "pluginName")]
+        plugin_name: String,
+        #[serde(rename = "presetName")]
+        preset_name: String,
+        /// Free-form JSON document chosen by the client.
+        data: serde_json::Value,
+    },
+    #[serde(rename = "load_preset")]
+    LoadPreset {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "pluginName")]
+        plugin_name: String,
+        #[serde(rename = "presetName")]
+        preset_name: String,
+    },
+    #[serde(rename = "list_presets")]
+    ListPresets {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "pluginName")]
+        plugin_name: String,
+    },
+    #[serde(rename = "delete_preset")]
+    DeletePreset {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        #[serde(rename = "pluginName")]
+        plugin_name: String,
+        #[serde(rename = "presetName")]
+        preset_name: String,
+    },
 }
-
-fn default_velocity() -> f32 { 0.8 }
-fn default_duration() -> f32 { 1.0 }
 
 #[derive(Serialize)]
 struct ErrorMsg {
@@ -161,6 +197,15 @@ impl PluginManager {
             CStr::from_ptr(cstr).to_string_lossy().to_string()
         };
 
+        // Wire into the realtime audio engine and expose a virtual MIDI port.
+        // If either fails the instance is still registered — params/state/GUI
+        // still work — but it won't be audible / drivable. Caller sees logs.
+        let rc = unsafe { auv3_engine_attach(ptr) };
+        if rc != 0 { warn!("engine_attach({label}) returned {rc}"); }
+        let c_label = CString::new(label).map_err(|e| format!("Invalid label: {e}"))?;
+        let rc = unsafe { auv3_create_midi_source(ptr, c_label.as_ptr()) };
+        if rc != 0 { warn!("create_midi_source({label}) returned {rc}"); }
+
         info!("Instance created: '{}' -> {} ({})", label, name, plugin_name);
 
         let handle = PluginHandle { ptr, name };
@@ -192,95 +237,79 @@ impl PluginManager {
     }
 }
 
-// ─── Audio rendering ────────────────────────────────────────────────────────
+// ─── Preset file storage ────────────────────────────────────────────────────
+// Layout: ~/.strudel-vst-bridge/presets/<plugin>/<preset>.json
+// Names are sanitized to filesystem-safe characters to keep this dumb.
 
-fn render_note(
-    handle: &PluginHandle,
-    note: u8,
-    velocity: f32,
-    duration_secs: f32,
-    _params: &HashMap<String, f32>,
-) -> Result<(Vec<f32>, Vec<f32>), String> {
-    let total_samples = (duration_secs * SAMPLE_RATE as f32) as usize;
-    let release_samples = (2.0 * SAMPLE_RATE as f32) as usize;
-    let max_samples = total_samples + release_samples;
-
-    // Single allocation upfront — render directly into these buffers
-    let mut left_out = vec![0.0f32; max_samples];
-    let mut right_out = vec![0.0f32; max_samples];
-
-    let vel_midi = (velocity.clamp(0.0, 1.0) * 127.0) as u8;
-
-    let rc = unsafe { auv3_note_on(handle.ptr, note, vel_midi, 0) };
-    if rc != 0 {
-        return Err(format!("MIDI note on failed: {rc}"));
-    }
-
-    let mut rendered = 0;
-    let bs = BLOCK_SIZE as usize;
-
-    // Note-on phase: render directly into output slices
-    while rendered < total_samples {
-        let frames = bs.min(total_samples - rendered);
-        let rc = unsafe {
-            auv3_render(
-                handle.ptr,
-                frames as u32,
-                left_out[rendered..].as_mut_ptr(),
-                right_out[rendered..].as_mut_ptr(),
-            )
-        };
-        if rc != 0 {
-            return Err(format!("Render failed: {rc}"));
-        }
-        rendered += frames;
-    }
-
-    unsafe { auv3_note_off(handle.ptr, note, 64, 0); }
-
-    // Release tail: render until silence
-    let silence_threshold = 1e-6_f32;
-    let mut silent_blocks = 0;
-
-    while rendered < max_samples && silent_blocks < 10 {
-        let frames = bs.min(max_samples - rendered);
-        let rc = unsafe {
-            auv3_render(
-                handle.ptr,
-                frames as u32,
-                left_out[rendered..].as_mut_ptr(),
-                right_out[rendered..].as_mut_ptr(),
-            )
-        };
-        if rc != 0 { break; }
-
-        let rms: f32 = left_out[rendered..rendered + frames].iter()
-            .chain(right_out[rendered..rendered + frames].iter())
-            .map(|s| s * s).sum::<f32>() / (frames * 2) as f32;
-
-        if rms < silence_threshold { silent_blocks += 1; } else { silent_blocks = 0; }
-        rendered += frames;
-    }
-
-    // Truncate to actual rendered length
-    left_out.truncate(rendered);
-    right_out.truncate(rendered);
-
-    Ok((left_out, right_out))
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
+        .collect()
 }
 
-fn encode_audio_response(request_id: u32, left: &[f32], right: &[f32]) -> Vec<u8> {
-    let num_samples = left.len() as u32;
-    let total_bytes = 8 + (left.len() + right.len()) * 4;
-    let mut buf = vec![0u8; total_bytes];
-    buf[0..4].copy_from_slice(&request_id.to_le_bytes());
-    buf[4..8].copy_from_slice(&num_samples.to_le_bytes());
-    // Bulk copy float slices as bytes (safe on LE architectures: x86, ARM)
-    let left_bytes = unsafe { std::slice::from_raw_parts(left.as_ptr() as *const u8, left.len() * 4) };
-    let right_bytes = unsafe { std::slice::from_raw_parts(right.as_ptr() as *const u8, right.len() * 4) };
-    buf[8..8 + left.len() * 4].copy_from_slice(left_bytes);
-    buf[8 + left.len() * 4..].copy_from_slice(right_bytes);
-    buf
+fn presets_root() -> Option<PathBuf> {
+    // Store next to the bridge binary's source tree: <bridge-dir>/presets/
+    // Resolved from CARGO_MANIFEST_DIR at compile time so it works regardless
+    // of where the binary is launched from.
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("presets");
+    Some(p)
+}
+
+fn preset_dir(plugin_name: &str) -> Option<PathBuf> {
+    let mut p = presets_root()?;
+    p.push(sanitize(plugin_name));
+    Some(p)
+}
+
+fn preset_path(plugin_name: &str, preset_name: &str) -> Option<PathBuf> {
+    let mut p = preset_dir(plugin_name)?;
+    p.push(format!("{}.json", sanitize(preset_name)));
+    Some(p)
+}
+
+fn save_preset_file(plugin_name: &str, preset_name: &str, data: &serde_json::Value) -> Result<(), String> {
+    let dir = preset_dir(plugin_name).ok_or("HOME not set")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
+    let path = preset_path(plugin_name, preset_name).ok_or("HOME not set")?;
+    let serialized = serde_json::to_string_pretty(data).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(&path, serialized).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+fn load_preset_file(plugin_name: &str, preset_name: &str) -> Result<serde_json::Value, String> {
+    let path = preset_path(plugin_name, preset_name).ok_or("HOME not set")?;
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+fn list_preset_files(plugin_name: &str) -> Result<Vec<String>, String> {
+    let dir = match preset_dir(plugin_name) {
+        Some(d) => d,
+        None => return Ok(vec![]),
+    };
+    if !dir.exists() {
+        return Ok(vec![]);
+    }
+    let mut out = vec![];
+    for entry in std::fs::read_dir(&dir).map_err(|e| format!("readdir {}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("entry: {e}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                out.push(stem.to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn delete_preset_file(plugin_name: &str, preset_name: &str) -> Result<(), String> {
+    let path = preset_path(plugin_name, preset_name).ok_or("HOME not set")?;
+    if !path.exists() {
+        return Err(format!("no such preset: {}", path.display()));
+    }
+    std::fs::remove_file(&path).map_err(|e| format!("remove: {e}"))
 }
 
 // ─── WebSocket server ───────────────────────────────────────────────────────
@@ -369,48 +398,6 @@ async fn handle_connection(
                         let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
                     }
 
-                    IncomingMessage::Render { request_id, plugin_id, note, velocity, duration, params } => {
-                        let plugin_arc = {
-                            let mgr = manager.lock().await;
-                            mgr.get_instance(&plugin_id)
-                        };
-
-                        match plugin_arc {
-                            Some(plugin_mutex) => {
-                                // Spawn render concurrently — don't block the message loop
-                                let write_clone = write.clone();
-                                tokio::spawn(async move {
-                                    let result = tokio::task::spawn_blocking(move || {
-                                        let handle = plugin_mutex.lock().unwrap();
-                                        render_note(&handle, note, velocity, duration, &params)
-                                    }).await;
-
-                                    let mut w = write_clone.lock().await;
-                                    match result {
-                                        Ok(Ok((left, right))) => {
-                                            let binary = encode_audio_response(request_id, &left, &right);
-                                            let _ = w.send(Message::Binary(binary)).await;
-                                        }
-                                        Ok(Err(e)) => {
-                                            error!("Render failed: {e}");
-                                            let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: e };
-                                            let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
-                                        }
-                                        Err(e) => {
-                                            let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message: format!("Panic: {e}") };
-                                            let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
-                                        }
-                                    }
-                                });
-                            }
-                            None => {
-                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id.clone()), request_id: Some(request_id), message: format!("No instance: {plugin_id}") };
-                                let mut w = write.lock().await;
-                                let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
-                            }
-                        }
-                    }
-
                     IncomingMessage::ShowGui { plugin_id } => {
                         let plugin_arc = {
                             let mgr = manager.lock().await;
@@ -466,6 +453,137 @@ async fn handle_connection(
                         let msg = ListMsg { msg_type: "plugin_list", plugins };
                         let mut w = write.lock().await;
                         let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                    }
+
+                    IncomingMessage::GetState { request_id, plugin_id } => {
+                        let plugin_arc = {
+                            let mgr = manager.lock().await;
+                            mgr.get_instance(&plugin_id)
+                        };
+                        let result: Result<String, String> = match plugin_arc {
+                            Some(p) => {
+                                let handle = p.lock().unwrap();
+                                let mut len: u32 = 0;
+                                let buf = unsafe { auv3_get_state(handle.ptr, &mut len as *mut u32) };
+                                if buf.is_null() || len == 0 {
+                                    Err("get_state failed".into())
+                                } else {
+                                    let slice = unsafe { std::slice::from_raw_parts(buf, len as usize) };
+                                    let encoded = B64.encode(slice);
+                                    unsafe { free(buf); }
+                                    Ok(encoded)
+                                }
+                            }
+                            None => Err(format!("No instance: {plugin_id}")),
+                        };
+                        let mut w = write.lock().await;
+                        match result {
+                            Ok(encoded) => {
+                                #[derive(Serialize)]
+                                struct Msg { #[serde(rename = "type")] msg_type: &'static str, #[serde(rename = "requestId")] request_id: u32, #[serde(rename = "pluginId")] plugin_id: String, state: String }
+                                let msg = Msg { msg_type: "state", request_id, plugin_id, state: encoded };
+                                let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                            }
+                            Err(message) => {
+                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message };
+                                let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                            }
+                        }
+                    }
+
+                    IncomingMessage::SavePreset { request_id, plugin_name, preset_name, data } => {
+                        let mut w = write.lock().await;
+                        match save_preset_file(&plugin_name, &preset_name, &data) {
+                            Ok(()) => {
+                                #[derive(Serialize)]
+                                struct Msg { #[serde(rename = "type")] msg_type: &'static str, #[serde(rename = "requestId")] request_id: u32, #[serde(rename = "pluginName")] plugin_name: String, #[serde(rename = "presetName")] preset_name: String }
+                                let msg = Msg { msg_type: "preset_saved", request_id, plugin_name, preset_name };
+                                let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                            }
+                            Err(e) => {
+                                let err = ErrorMsg { msg_type: "error", plugin_id: None, request_id: Some(request_id), message: e };
+                                let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                            }
+                        }
+                    }
+
+                    IncomingMessage::LoadPreset { request_id, plugin_name, preset_name } => {
+                        let mut w = write.lock().await;
+                        match load_preset_file(&plugin_name, &preset_name) {
+                            Ok(data) => {
+                                #[derive(Serialize)]
+                                struct Msg { #[serde(rename = "type")] msg_type: &'static str, #[serde(rename = "requestId")] request_id: u32, #[serde(rename = "pluginName")] plugin_name: String, #[serde(rename = "presetName")] preset_name: String, data: serde_json::Value }
+                                let msg = Msg { msg_type: "preset", request_id, plugin_name, preset_name, data };
+                                let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                            }
+                            Err(e) => {
+                                let err = ErrorMsg { msg_type: "error", plugin_id: None, request_id: Some(request_id), message: e };
+                                let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                            }
+                        }
+                    }
+
+                    IncomingMessage::ListPresets { request_id, plugin_name } => {
+                        let mut w = write.lock().await;
+                        match list_preset_files(&plugin_name) {
+                            Ok(names) => {
+                                #[derive(Serialize)]
+                                struct Msg { #[serde(rename = "type")] msg_type: &'static str, #[serde(rename = "requestId")] request_id: u32, #[serde(rename = "pluginName")] plugin_name: String, presets: Vec<String> }
+                                let msg = Msg { msg_type: "preset_list", request_id, plugin_name, presets: names };
+                                let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                            }
+                            Err(e) => {
+                                let err = ErrorMsg { msg_type: "error", plugin_id: None, request_id: Some(request_id), message: e };
+                                let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                            }
+                        }
+                    }
+
+                    IncomingMessage::DeletePreset { request_id, plugin_name, preset_name } => {
+                        let mut w = write.lock().await;
+                        match delete_preset_file(&plugin_name, &preset_name) {
+                            Ok(()) => {
+                                #[derive(Serialize)]
+                                struct Msg { #[serde(rename = "type")] msg_type: &'static str, #[serde(rename = "requestId")] request_id: u32, #[serde(rename = "pluginName")] plugin_name: String, #[serde(rename = "presetName")] preset_name: String }
+                                let msg = Msg { msg_type: "preset_deleted", request_id, plugin_name, preset_name };
+                                let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                            }
+                            Err(e) => {
+                                let err = ErrorMsg { msg_type: "error", plugin_id: None, request_id: Some(request_id), message: e };
+                                let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                            }
+                        }
+                    }
+
+                    IncomingMessage::SetState { request_id, plugin_id, state } => {
+                        let plugin_arc = {
+                            let mgr = manager.lock().await;
+                            mgr.get_instance(&plugin_id)
+                        };
+                        let result: Result<(), String> = match plugin_arc {
+                            Some(p) => match B64.decode(state.as_bytes()) {
+                                Ok(bytes) => {
+                                    let handle = p.lock().unwrap();
+                                    let rc = unsafe { auv3_set_state(handle.ptr, bytes.as_ptr(), bytes.len() as u32) };
+                                    if rc == 0 { Ok(()) } else { Err(format!("set_state failed: {rc}")) }
+                                }
+                                Err(e) => Err(format!("base64 decode: {e}")),
+                            },
+                            None => Err(format!("No instance: {plugin_id}")),
+                        };
+                        let mut w = write.lock().await;
+                        match result {
+                            Ok(()) => {
+                                #[derive(Serialize)]
+                                struct Msg { #[serde(rename = "type")] msg_type: &'static str, #[serde(rename = "requestId")] request_id: u32, #[serde(rename = "pluginId")] plugin_id: String }
+                                let msg = Msg { msg_type: "state_loaded", request_id, plugin_id };
+                                let _ = w.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                            }
+                            Err(message) => {
+                                let err = ErrorMsg { msg_type: "error", plugin_id: Some(plugin_id), request_id: Some(request_id), message };
+                                let _ = w.send(Message::Text(serde_json::to_string(&err).unwrap())).await;
+                            }
+                        }
                     }
                 }
             }
